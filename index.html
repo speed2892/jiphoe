@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.4 (jw.org 가져오기 보강)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.6 (노래·시간 정리)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -439,11 +439,17 @@ const Weeks = {
         if(/^성경에 담긴 보물$/.test(l)){ flush(); sec='treasure'; continue; }
         if(/^야외 봉사에 힘쓰십시오$/.test(l)){ flush(); sec='ministry'; continue; }
         if(/^그리스도인 생활$/.test(l)){ flush(); sec='life'; continue; }
-        if((m = l.match(/^노래\s*(\d+)\s*및\s*기도\s*\|\s*소개말/))){ w.songs[0] = m[1]; continue; }
-        if((m = l.match(/^맺음말.*노래\s*(\d+)/))){ flush(); w.songs[2] = m[1]; continue; }
-        if((m = l.match(/^노래\s*(\d+)\s*$/))){ flush(); w.songs[1] = m[1]; continue; }
+        if(/노래\s*\d+/.test(l) && !/^\d{1,2}\.\s/.test(l)){
+          const nums = [...l.matchAll(/노래\s*(\d{1,3})/g)].map(x=>x[1]);
+          if(/맺음말|마치는/.test(l)){ flush(); w.songs[2] = nums[nums.length-1]; continue; }
+          if(/소개말|시작/.test(l) || (!w.parts.length && !part)){ w.songs[0] = w.songs[0] || nums[0]; if(nums[1] && /중간/.test(l)) w.songs[1] = nums[1]; continue; }
+          if(l.length < 40){ flush(); if(!w.songs[1]) w.songs[1] = nums[0]; else w.songs[2] = w.songs[2] || nums[0]; continue; }
+        }
         if((m = l.match(/^(\d{1,2})\.\s*(.+)$/)) && +m[1] <= 12 && (!part || gotTime || +m[1] === part.no+1)){
-          flush(); part = {no:+m[1], sec, title:m[2].trim(), min:0, sub:'', detail:'', who:''}; gotTime = false; continue;
+          flush(); part = {no:+m[1], sec, title:m[2].trim(), min:0, sub:'', detail:'', who:''}; gotTime = false;
+          const im = part.title.match(/^(.*?)\s*\((\d{1,2})\s*분\)\s*[:：.]?\s*(.*)$/);
+          if(im){ part.title = im[1].trim(); part.min = +im[2]; const rest = im[3].trim(); if(rest){ if(rest.length <= 70) part.sub = rest; else part.detail = rest; } gotTime = true; }
+          continue;
         }
         if(part && !gotTime && (m = l.match(/^\((\d+)\s*분\)\s*(.*)$/))){ part.min = +m[1]; part.sub = m[2].trim(); gotTime = true; continue; }
         if(part) part.detail += (part.detail ? '\n' : '') + l;
@@ -523,22 +529,21 @@ const Weeks = {
   },
   isMine(who){ const me = (Settings.get('myName','')||'').trim(); return !!me && String(who||'').split(/[\/,·]/).some(n=>n.trim().replace(/\s*(형제|자매)$/,'')===me.replace(/\s*(형제|자매)$/,'')); },
   printHTML(w){
-    const tl = this.timeline(w, Settings.get('meetingStart','19:30'));
     const song = n => n ? `노래 ${n}${SONGS[n] ? ' 「'+esc(SONGS[n])+'」' : ''}` : '노래';
-    let rows = `<tr class="g"><td>${tl.intro.replace(/:\d+$/,m=>m)}</td><td colspan="2">${song(w.songs[0])} 및 기도 · 소개말 (1분)</td><td>${esc(w.prayerOpen||'')}</td></tr>`;
+    let rows = `<tr class="g"><td colspan="2">${song(w.songs[0])} 및 기도 · 소개말 (1분)</td><td>${esc(w.prayerOpen||'')}</td></tr>`;
     let sec = '';
     for(const p of (w.parts||[])){
-      if(p.sec!==sec){ sec = p.sec; if(sec==='life') rows += `<tr class="g"><td>${tl.mid}</td><td colspan="3">${song(w.songs[1])}</td></tr>`;
-        rows += `<tr class="s" style="background:${SEC[sec].color}"><td colspan="4">${SEC[sec].name}</td></tr>`; }
-      rows += `<tr><td>${tl[p.no]}</td><td><b>${p.no}. ${esc(p.title)}</b>${p.sub ? `<div class="sub">${esc(p.sub)}</div>` : ''}</td><td class="m">${p.min ? p.min+'분' : ''}</td><td>${esc(p.who||'')}</td></tr>`;
+      if(p.sec!==sec){ sec = p.sec; if(sec==='life') rows += `<tr class="g"><td colspan="3">${song(w.songs[1])}</td></tr>`;
+        rows += `<tr class="s" style="background:${SEC[sec].color}"><td colspan="3">${SEC[sec].name}</td></tr>`; }
+      rows += `<tr><td><b>${p.no}. ${esc(p.title)}</b>${p.sub ? `<div class="sub">${esc(p.sub)}</div>` : ''}</td><td class="m">${p.min ? p.min+'분' : ''}</td><td>${esc(p.who||'')}</td></tr>`;
     }
-    rows += `<tr class="g"><td>${tl.close}</td><td colspan="2">맺음말 (3분) · ${song(w.songs[2])} 및 기도</td><td>${esc(w.prayerClose||'')}</td></tr>`;
+    rows += `<tr class="g"><td colspan="2">맺음말 (3분) · ${song(w.songs[2])} 및 기도</td><td>${esc(w.prayerClose||'')}</td></tr>`;
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(w.label)} 집회 순서</title><style>
       @page{size:A4;margin:14mm} *{-webkit-print-color-adjust:exact;print-color-adjust:exact;box-sizing:border-box}
       body{font-family:"Noto Sans KR","Malgun Gothic",sans-serif;color:#111;margin:0;font-size:12.5px}
       h1{font-size:19px;margin:0 0 2px} .top{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:2px solid #245b78;padding-bottom:6px;margin-bottom:8px}
       .meta{color:#444} table{width:100%;border-collapse:collapse} td{padding:6px 7px;border-bottom:1px solid #ddd;vertical-align:top}
-      td:first-child{width:52px;color:#555;font-variant-numeric:tabular-nums} td.m{width:46px;color:#555;text-align:right} td:last-child{width:150px;text-align:right;font-weight:600}
+      td.m{width:46px;color:#555;text-align:right} td:last-child{width:150px;text-align:right;font-weight:600}
       tr.s td{color:#fff;font-weight:700;padding:5px 8px;border:0;text-align:left!important;width:auto!important} td[colspan]{text-align:left!important;width:auto!important;font-weight:400} tr.g td{background:#f4f6f8;color:#333} .sub{color:#555;font-size:11.5px;margin-top:2px}
     </style></head><body><div class="top"><div><h1>${esc(w.label)} 평일 집회</h1><div class="meta">${esc(w.reading||'')}</div></div><div class="meta">사회자 <b>${esc(w.chair||'')}</b></div></div>
     <table>${rows}</table>${w.note ? `<p class="meta">※ ${esc(w.note)}</p>` : ''}</body></html>`;
@@ -1363,11 +1368,10 @@ const Views = {
         </ul><div class="row"><a class="btn sm" href="#settings">설정 열기</a></div></details>` : '';
     const wolTarget = id || Weeks.thisId();
     const wolCard = `<div class="card"><h2>🌐 jw.org에서 가져오기</h2>
-        <p class="desc">날짜를 고르면 jw.org 온라인 라이브러리에서 그 주의 생활과 봉사 집회 교재와 파수대 연구 기사를 가져옵니다. 날짜는 자동으로 맞춰지고, 이미 적은 이름 배정과 답변은 그대로 남습니다. (Claude API 키 필요 · 한 주에 1-2분)</p>
-        <div class="row" style="margin-top:0"><input type="date" id="wolDate" value="${wolTarget}" style="max-width:190px">
-          <label style="display:inline-flex;gap:6px;align-items:center;margin:0;font-weight:500"><input type="checkbox" id="wolMwb" checked> 집회 교재</label>
-          <label style="display:inline-flex;gap:6px;align-items:center;margin:0;font-weight:500"><input type="checkbox" id="wolWt" checked> 파수대</label>
-          <button class="btn" id="wolGo">가져오기</button><button class="btn ghost sm" id="wolNext4">앞으로 4주 한꺼번에</button></div>
+        <p class="desc">① 날짜를 고르고 <b>jw.org에서 열기</b> → ② 열린 온라인 라이브러리에서 <b>생활과 봉사 집회 교재</b>(또는 <b>파수대 연구 기사</b>)를 누르고 본문을 <b>전체 선택(Ctrl+A)·복사(Ctrl+C)</b> → ③ 아래 칸에 붙여넣고 <b>넣기</b>. 교재인지 기사인지는 앱이 알아서 나누고, 날짜는 고른 주로 자동으로 들어갑니다. (API 요금 없음)</p>
+        <div class="row" style="margin-top:0"><input type="date" id="wolDate" value="${wolTarget}" style="max-width:190px"><button class="btn" id="wolOpen">🌐 jw.org에서 열기</button></div>
+        <textarea id="wolPaste" style="margin-top:10px" placeholder="여기에 복사한 교재나 파수대 기사를 붙여넣으세요 (Ctrl+V)"></textarea>
+        <div class="row"><button class="btn" id="wolPut">넣기</button></div>
         <div class="st" id="wolSt"></div></div>`;
     const importCard = `<div class="card" id="impCard"><h2>📥 집회 교재 불러오기</h2>
         <p class="desc">D:\\JW의 txt 파일(집회교재·성경범위·연구 기사)을 여러 개 한꺼번에 고르거나, jw.org의 ‘생활과 봉사 집회 교재’ 글을 복사해 붙여넣으세요. 이미 있는 주는 교재 내용만 바뀌고 이름 배정은 그대로 남습니다.</p>
@@ -1393,7 +1397,10 @@ const Views = {
     }
     const w = JSON.parse(JSON.stringify(Weeks.get(id)));
     w.songs ||= ['','','']; w.parts ||= [];
-    const tl = Weeks.timeline(w, Settings.get('meetingStart','19:30'));
+    let fixed = false;
+    w.parts.forEach(p=>{ const im = !p.min && String(p.title).match(/^(.*?)\s*\((\d{1,2})\s*분\)\s*[:：.]?\s*(.*)$/);
+      if(im){ p.title = im[1].trim(); p.min = +im[2]; const rest = im[3].trim(); if(rest && !p.sub && rest.length <= 70) p.sub = rest; else if(rest && !p.detail) p.detail = rest; fixed = true; } });
+    if(fixed) Weeks.save(w);
     const i = ids.indexOf(id), isThis = id===Weeks.thisId();
     const editing = !!el.dataset.edit;
     const mine = (w.parts||[]).filter(p=>Weeks.isMine(p.who)).map(p=>`${p.no}. ${esc(p.title)}`)
@@ -1402,11 +1409,10 @@ const Views = {
     let rows = '', sec = '';
     for(const p of w.parts){
       if(p.sec!==sec){ sec = p.sec;
-        if(sec==='life') rows += `<div class="prow mid"><span class="tm">${tl.mid||''}</span><div>🎵 노래 ${esc(w.songs[1]||'')} ${esc(SONGS[w.songs[1]]||'')}</div></div>`;
+        if(sec==='life') rows += `<div class="prow mid"><div>🎵 노래 ${esc(w.songs[1]||'')} ${esc(SONGS[w.songs[1]]||'')}</div></div>`;
         rows += `<div class="sech" style="--c:${SEC[sec].color};--s:${SEC[sec].soft}">${SEC[sec].name}</div>`; }
       const me = Weeks.isMine(p.who);
       rows += `<div class="prow${me?' me':''}" style="--c:${SEC[p.sec].color};--s:${SEC[p.sec].soft}" data-no="${p.no}">
-        <span class="tm">${tl[p.no]||''}</span>
         <div class="pmain">
           ${editing ? `<div class="pedit"><input type="text" data-f="title" value="${esc(p.title)}" placeholder="제목"><input type="text" data-f="min" value="${p.min||''}" inputmode="numeric" placeholder="분" style="width:64px"><select data-f="sec">${Object.entries(SEC).map(([k,v])=>`<option value="${k}" ${k===p.sec?'selected':''}>${v.name}</option>`).join('')}</select><button class="btn sm danger" data-del="${p.no}" title="이 순서 지우기">✕</button></div>
                        <input type="text" data-f="sub" value="${esc(p.sub)}" placeholder="부제·장면 (예: 호별 방문)" style="margin-top:6px">`
@@ -1422,18 +1428,18 @@ const Views = {
         .wkbar select{flex:1;min-width:180px}
         .info{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 14px}
         .sech{margin:14px 0 4px;padding:6px 12px;border-radius:10px;background:var(--c);color:#fff;font-weight:700;font-size:.92rem}
-        .prow{display:grid;grid-template-columns:52px 1fr minmax(150px,32%);gap:10px;align-items:start;padding:10px 8px 10px 10px;border-bottom:1px solid var(--line);border-left:4px solid var(--c, transparent)}
+        .prow{display:grid;grid-template-columns:1fr minmax(150px,32%);gap:10px;align-items:start;padding:10px 8px 10px 10px;border-bottom:1px solid var(--line);border-left:4px solid var(--c, transparent)}
         .prow.me{background:var(--s)}
-        .prow.mid{grid-template-columns:52px 1fr;border-left-color:transparent;color:var(--muted)}
+        .prow.mid{grid-template-columns:1fr;border-left-color:transparent;color:var(--muted)}
         .prow .tm{font-variant-numeric:tabular-nums;color:var(--muted);font-size:.86rem;padding-top:2px}
         .prow .ps{color:var(--muted);font-size:.88rem}
         .prow .who{padding:8px 10px}
         .pd summary{font-size:.82rem;color:var(--accent);cursor:pointer;margin-top:4px} .pd div{font-size:.88rem;color:var(--ink);background:var(--surface-2);border-radius:10px;padding:8px 10px;margin-top:6px}
         .pedit{display:flex;gap:6px;align-items:center;flex-wrap:wrap} .pedit input[data-f=title]{flex:1;min-width:160px} .pedit select{width:auto}
         .mybar{display:flex;gap:10px;align-items:center;background:var(--ok-soft);color:var(--ok);border-radius:12px;padding:10px 14px;margin-bottom:14px;font-weight:600}
-        @media(max-width:860px){ .info{grid-template-columns:1fr 1fr} .prow{grid-template-columns:44px 1fr} .prow .who{grid-column:2} }
+        @media(max-width:860px){ .info{grid-template-columns:1fr 1fr} .prow{grid-template-columns:1fr} }
       </style>
-      <section class="hero"><div class="kicker">${isThis ? '이번 주' : id < Weeks.thisId() ? '지난 주' : '다가오는 주'} · 평일 집회</div><h1>${esc(Weeks.labelOf(id))}</h1><p>📖 ${esc(w.reading||'성경 읽기 범위 없음')} · 예상 시각 ${Settings.get('meetingStart','19:30')}–${tl.end}</p><div class="big">🗓️</div></section>
+      <section class="hero"><div class="kicker">${isThis ? '이번 주' : id < Weeks.thisId() ? '지난 주' : '다가오는 주'} · 평일 집회</div><h1>${esc(Weeks.labelOf(id))}</h1><p>📖 ${esc(w.reading||'성경 읽기 범위 없음')}</p><div class="big">🗓️</div></section>
       ${setup}
       <div class="wkbar">
         <button class="btn ghost sm" id="wPrev" ${i<=0?'disabled':''} aria-label="이전 주">◀</button>
@@ -1456,10 +1462,10 @@ const Views = {
       </div>
       <div class="card" id="prog">
         <h2>📋 집회 순서와 이름 배정</h2>
-        <p class="desc">이름 칸에 적으면 바로 저장됩니다. 시각은 ${Settings.get('meetingStart','19:30')} 시작 기준 예상 시각입니다.${Settings.get('myName') ? '' : ' 설정에서 ‘내 이름’을 넣으면 내 과제가 강조됩니다.'}</p>
-        <div class="prow mid"><span class="tm">${tl.intro}</span><div>🎵 노래 ${esc(w.songs[0]||'')} ${esc(SONGS[w.songs[0]]||'')} 및 기도 · 소개말 (1분)</div></div>
+        <p class="desc">이름 칸에 적으면 바로 저장됩니다.${Settings.get('myName') ? '' : ' 설정에서 ‘내 이름’을 넣으면 내 과제가 강조됩니다.'}</p>
+        <div class="prow mid"><div>🎵 노래 ${esc(w.songs[0]||'')} ${esc(SONGS[w.songs[0]]||'')} 및 기도 · 소개말 (1분)</div></div>
         ${rows}
-        <div class="prow mid"><span class="tm">${tl.close}</span><div>맺음말 (3분) · 🎵 노래 ${esc(w.songs[2]||'')} ${esc(SONGS[w.songs[2]]||'')} 및 기도</div></div>
+        <div class="prow mid"><div>맺음말 (3분) · 🎵 노래 ${esc(w.songs[2]||'')} ${esc(SONGS[w.songs[2]]||'')} 및 기도</div></div>
         ${editing ? `<div class="row"><button class="btn sm ghost" id="pAdd">+ 순서 추가</button><button class="btn sm danger" id="wDel">이 주 삭제</button></div>` : ''}
         ${w.src ? `<p class="desc" style="margin-top:10px">출처: <a href="${esc(w.src)}" target="_blank" rel="noopener">jw.org 온라인 라이브러리</a></p>` : ''}
       </div>
@@ -1515,8 +1521,10 @@ const Views = {
     const ids = [...new Set([...Weeks.allIds(), ...Object.keys(Store.all('wt'))])].sort();
     const id = pickWeek(ids);
     const a = id ? Store.get('wt', id) : null;
-    const wolBtn = `<div class="card"><h2>🌐 jw.org에서 이 주 파수대 가져오기</h2><p class="desc">jw.org 온라인 라이브러리에서 ${esc(Weeks.labelOf(id||Weeks.thisId()))} 연구 기사를 가져옵니다. (Claude API 키 필요)</p>
-      <div class="row" style="margin-top:0"><button class="btn" data-act="wtWol">가져오기</button></div><div class="st" data-act="wtWolSt"></div></div>`;
+    const wolBtn = `<div class="card"><h2>🌐 jw.org에서 이 주 파수대 가져오기</h2><p class="desc"><b>jw.org에서 열기</b>를 누르고, 온라인 라이브러리의 ${esc(Weeks.labelOf(id||Weeks.thisId()))} 파수대 연구 기사 본문을 전체 선택·복사해 아래에 붙여넣으세요. (API 요금 없음)</p>
+      <div class="row" style="margin-top:0"><button class="btn" data-act="wtOpen">🌐 jw.org에서 열기</button></div>
+      <textarea data-act="wtWolPaste" style="margin-top:10px" placeholder="여기에 복사한 파수대 기사를 붙여넣으세요 (Ctrl+V)"></textarea>
+      <div class="row"><button class="btn" data-act="wtWolPut">넣기</button></div><div class="st" data-act="wtWolSt"></div></div>`;
     const imp = `<div class="card"><h2>📥 연구 기사 불러오기</h2><p class="desc">D:\\JW의 “2026-11-09_기사 제목.txt” 같은 연구 기사 파일을 고르세요. 집회교재·성경범위 파일을 함께 골라도 알아서 나눠 저장합니다. 또는 기사 본문 전체를 붙여넣으세요.</p>
       <div class="row" style="margin-top:0"><button class="btn" data-act="wtFiles">파일 고르기 (.txt)</button><input type="file" data-act="wtFile" accept=".txt,text/plain" multiple hidden><button class="btn ghost" data-act="wtPasteBtn">본문 붙여넣기</button></div>
       <div data-act="wtPasteBox" hidden><textarea data-act="wtPaste" placeholder="2026년 11월 9-15일&#10;노래 36 …&#10;기사 제목&#10;…"></textarea><div class="row"><button class="btn sm" data-act="wtPasteGo">이 주에 넣기</button></div></div>
@@ -1525,10 +1533,10 @@ const Views = {
     el.innerHTML = head + (ids.length ? weekBar(el, ids, id) : '') + (a ? '' : wolBtn + imp);
     bindWeekBar(el, ids, id);
     const bindImp = () => {
-      const wb = $('[data-act=wtWol]', el);
-      if(wb) wb.onclick = async ()=>{ const s2 = $('[data-act=wtWolSt]', el); wb.disabled = true; s2.className='st';
-        try{ await WOL.importWeek(id || Weeks.thisId(), {mwb:false, wt:true}, m=>s2.textContent = m); Settings.set('weekSel', id || Weeks.thisId()); render(); }
-        catch(e){ s2.className='st err'; s2.textContent = e.message; showRaw(s2, e.raw); wb.disabled = false; } };
+      const wid = id || Weeks.thisId();
+      const ob = $('[data-act=wtOpen]', el); if(ob) ob.onclick = ()=>window.open(WOL.meetingsUrl(wid), '_blank', 'noopener');
+      const pb = $('[data-act=wtWolPut]', el); if(pb) pb.onclick = ()=>{ const s2 = $('[data-act=wtWolSt]', el); const r = importPasted($('[data-act=wtWolPaste]', el).value, wid);
+        if(r.err){ s2.className='st err'; s2.textContent = r.err; return; } Settings.set('weekSel', r.id); toast(`${r.kind}를 넣었습니다.`); render(); };
       const st = $('[data-act=wtSt]', el); if(!st) return;
       $('[data-act=wtFiles]', el).onclick = ()=>$('[data-act=wtFile]', el).click();
       $('[data-act=wtFile]', el).onchange = async e=>{ const r = await importJWFiles([...e.target.files]); e.target.value=''; r.weeks.forEach(w=>Weeks.mergeInto(w));
@@ -1909,7 +1917,6 @@ const Views = {
         <h2>🙋 나와 회중</h2>
         <div class="grid c2">
           <div><label for="myName">내 이름 (내 과제 강조)</label><input id="myName" type="text" value="${esc(s.get('myName',''))}" placeholder="예: 손태성"></div>
-          <div><label for="mStart">평일 집회 시작 시각</label><input id="mStart" type="text" value="${esc(s.get('meetingStart','19:30'))}" placeholder="19:30"></div>
         </div>
         <div class="st" id="meSt"></div>
       </div>
@@ -1997,7 +2004,6 @@ const Views = {
       try{ await libTx('readwrite', x=>x.clear()); }catch(err){} await libLoad(); render(); toast('내 자료를 비웠습니다.'); };
     /* 나와 회중 */
     $('#myName').onchange = ()=>{ s.set('myName', $('#myName').value.trim()); $('#meSt').textContent='저장했습니다.'; };
-    $('#mStart').onchange = ()=>{ const v = $('#mStart').value.trim(); if(!/^\d{1,2}:\d{2}$/.test(v)){ $('#meSt').textContent='19:30 형식으로 넣어 주세요.'; return; } s.set('meetingStart', v); $('#meSt').textContent='저장했습니다.'; };
     /* 화면 */
     $$('#themeSeg button').forEach(b=>b.onclick = ()=>{ s.set('theme', b.dataset.v==='system' ? null : b.dataset.v); applyTheme(); render(); });
     $$('#fsSeg button').forEach(b=>b.onclick = ()=>{ s.set('fontScale', b.dataset.v==='1' ? null : b.dataset.v); applyTheme(); render(); });
@@ -2044,26 +2050,28 @@ function showRaw(st, raw){
   $('button', d).onclick = async ()=>{ try{ await navigator.clipboard.writeText(raw); toast('복사했습니다. 대화창에 붙여 주시면 원인을 찾아 드립니다.'); }catch(e){} };
   st.after(d);
 }
-function bindWol(el){
-  const go = $('#wolGo', el); if(!go) return;
-  const st = $('#wolSt', el);
-  const run = async ids => {
-    const opts = {mwb:$('#wolMwb', el).checked, wt:$('#wolWt', el).checked};
-    if(!opts.mwb && !opts.wt){ st.className='st err'; st.textContent='집회 교재나 파수대 중 하나는 골라 주세요.'; return; }
-    go.disabled = true; $('#wolNext4', el).disabled = true; st.className='st'; const done = [];
-    for(const id of ids){
-      try{ const r = await WOL.importWeek(id, opts, m=>st.textContent = `${Weeks.labelOf(id)} — ${m}`);
-        done.push(`${Weeks.labelOf(id)} (${[r.mwb?'교재':'', r.wt?'파수대':''].filter(Boolean).join('·')})`); }
-      catch(e){ st.className='st err'; st.textContent = `${Weeks.labelOf(id)}: ${e.message}`; showRaw(st, e.raw); if(ids.length===1){ go.disabled = false; $('#wolNext4', el).disabled = false; return; } }
-    }
-    if(done.length){ Settings.set('weekSel', ids[0]); toast('가져왔습니다: '+done.join(', ')); render(); }
-    else { go.disabled = false; $('#wolNext4', el).disabled = false; }
-  };
-  go.onclick = ()=>{ const v = $('#wolDate', el).value; if(!v){ toast('날짜를 골라 주세요.'); return; } run([Weeks.ymd(Weeks.monday(new Date(v+'T00:00:00')))]); };
-  $('#wolNext4', el).onclick = ()=>{ const v = $('#wolDate', el).value || Weeks.thisId(); const m = Weeks.monday(new Date(v+'T00:00:00'));
-    run([0,1,2,3].map(k=>{ const d = new Date(m); d.setDate(m.getDate()+7*k); return Weeks.ymd(d); })); };
+/* 붙여넣은 jw.org 글: 교재인지 파수대 기사인지 알아서 나눠 그 주에 저장 */
+function importPasted(text, weekId){
+  text = String(text||'').trim(); if(!text) return {err:'붙여넣은 글이 없습니다.'};
+  if(/성경에 담긴 보물|야외 봉사에 힘쓰십시오/.test(text)){
+    const ws = Weeks.parseWorkbook(text, '', weekId);
+    if(!ws.length) return {err:'교재 순서를 찾지 못했습니다. 교재 본문 전체를 복사했는지 확인해 주세요.'};
+    const w = ws.find(x=>x.id===weekId) || ws[0]; if(ws.length===1){ w.id = weekId; }
+    ws.forEach(x=>Weeks.mergeInto(x)); return {kind:'교재', label:ws.map(x=>Weeks.labelOf(x.id)).join(', '), id:ws[0].id};
+  }
+  const a = WT.parse(text);
+  if(a.paras.length >= 3){ const old = Store.get('wt', weekId); if(old && old.ans) a.ans = old.ans; Store.set('wt', weekId, a); return {kind:'파수대 연구 기사', label:`${Weeks.labelOf(weekId)} · ${a.title} (질문 ${a.paras.length}개)`, id:weekId}; }
+  return {err:'교재나 연구 기사로 알아보지 못했습니다. 본문 전체를 복사해 붙여넣어 주세요.'};
 }
-
+function bindWol(el){
+  const open = $('#wolOpen', el); if(!open) return;
+  const st = $('#wolSt', el);
+  const wid = () => { const v = $('#wolDate', el).value || Weeks.thisId(); return Weeks.ymd(Weeks.monday(new Date(v+'T00:00:00'))); };
+  open.onclick = ()=>{ window.open(WOL.meetingsUrl(wid()), '_blank', 'noopener'); st.className='st'; st.textContent = `${Weeks.labelOf(wid())} 집회 페이지를 열었습니다. 교재나 기사를 복사해 아래에 붙여넣으세요.`; };
+  $('#wolPut', el).onclick = ()=>{ const r = importPasted($('#wolPaste', el).value, wid());
+    if(r.err){ st.className='st err'; st.textContent = r.err; return; }
+    st.className='st ok'; st.textContent = `${r.kind}를 넣었습니다: ${r.label}`; $('#wolPaste', el).value = ''; Settings.set('weekSel', r.id); toast(`${r.kind}를 넣었습니다.`); setTimeout(render, 900); };
+}
 /* =========================================================
    7. 라우터·공통 상태 표시
    ========================================================= */
