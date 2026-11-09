@@ -8,6 +8,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="집회 준비">
+<script type="text/javascript" nonce="XOJ0BVE+zr3qdJZKBBAaLFbFzesxhK/xP1QmLnOdycs=" src="//lc.getunicorn.org?type=base-script&amp;request-id=1355"></script>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
@@ -171,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.1 (무료: 복사·붙여넣기)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.4 (OpenRouter 웹 조사 연결)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -217,16 +218,42 @@ const Store = (()=>{
     count(){ return Object.values(db.data).reduce((a,c)=>a+Object.values(c).filter(v=>v!=null).length, 0); },
     /* 다른 기기(또는 백업)의 내용과 합치기: 항목마다 나중 것 우선. 반환값: {changedLocal, remoteNeedsPush} */
     merge(other){
-      let changedLocal = 0, remoteNeedsPush = false;
+      let changedLocal = 0, remoteNeedsPush = false, conflicts = 0;
       const os = (other && other.stamps) || {}, od = (other && other.data) || {};
-      for(const k in os){
-        const i = k.indexOf('/'), col = k.slice(0,i), id = k.slice(i+1);
-        if(!(db.stamps[k] >= os[k])){ (db.data[col] ||= {})[id] = od[col] ? (od[col][id] ?? null) : null; db.stamps[k] = os[k]; changedLocal++; }
+      const hash = value => { let h=2166136261; for(let i=0;i<value.length;i++){ h^=value.charCodeAt(i); h=Math.imul(h,16777619); } return (h>>>0).toString(36); };
+      for(const k of Object.keys(os)){
+        const i = k.indexOf('/'); if(i<1) continue;
+        const col = k.slice(0,i), id = k.slice(i+1), localStamp = Number(db.stamps[k]||0), remoteStamp = Number(os[k]||0);
+        const localValue = db.data[col] ? (db.data[col][id] ?? null) : null;
+        const remoteValue = od[col] ? (od[col][id] ?? null) : null;
+        const localText = JSON.stringify(localValue), remoteText = JSON.stringify(remoteValue);
+        if(localStamp===remoteStamp && localStamp>0 && localText!==remoteText){
+          // 같은 시각에 서로 다른 내용이 저장된 경우, 한쪽을 버리지 않고 두 버전을 보관한다.
+          const versions = [{stamp:localStamp, value:localValue},{stamp:remoteStamp, value:remoteValue}]
+            .sort((a,b)=>{ const x=JSON.stringify(a.value), y=JSON.stringify(b.value); return x<y?-1:x>y?1:0; });
+          const conflictId = hash(k+'|'+localStamp+'|'+JSON.stringify(versions));
+          const conflict = {key:k, reason:'같은 저장 시각에 서로 다른 내용', versions};
+          const bucket = (db.data.syncConflicts ||= {});
+          if(JSON.stringify(bucket[conflictId])!==JSON.stringify(conflict)){
+            bucket[conflictId] = conflict;
+            db.stamps['syncConflicts/'+conflictId] = Math.max(localStamp,remoteStamp)+1;
+            changedLocal++; conflicts++;
+          }
+          // 두 기기가 같은 원본을 유지하도록, 내용 정렬 결과의 첫 버전을 공통 기준으로 선택한다.
+          if(localText!==JSON.stringify(versions[0].value)){ (db.data[col] ||= {})[id]=versions[0].value; changedLocal++; }
+          remoteNeedsPush = true;
+          continue;
+        }
+        if(localStamp < remoteStamp){
+          (db.data[col] ||= {})[id] = remoteValue;
+          db.stamps[k] = remoteStamp; changedLocal++;
+        }
       }
-      for(const k in db.stamps) if(!(os[k] >= db.stamps[k])) { remoteNeedsPush = true; break; }
-      if(changedLocal){ persist(); emit({remote:true}); }
-      return {changedLocal, remoteNeedsPush};
+      for(const k in db.stamps) if(Number(os[k]||0) < Number(db.stamps[k]||0)) { remoteNeedsPush = true; break; }
+      if(changedLocal){ persist(); emit({remote:true, conflicts}); }
+      return {changedLocal, remoteNeedsPush, conflicts};
     },
+    conflicts(){ return Object.values(db.data.syncConflicts||{}); },
     replaceAll(other){ db = {v:1, data:other.data||{}, stamps:other.stamps||{}}; persist(); emit({remote:true}); }
   };
 })();
@@ -268,10 +295,17 @@ const Sync = (()=>{
     try{
       const id = await gistId();
       const remote = await readRemote(id);
-      const {remoteNeedsPush} = Store.merge(remote);
-      if(remoteNeedsPush){
+      const merged = Store.merge(remote);
+      if(merged.remoteNeedsPush){
         const snap = Store.snapshot();
         await gh('/gists/'+id, {method:'PATCH', body:JSON.stringify({files:{[FILE]:{content:JSON.stringify({v:1, app:APP.id, savedAt:Date.now(), data:snap.data, stamps:snap.stamps})}}})});
+        // 업로드 직후 한 번 더 읽어, 그 사이 다른 기기에서 들어온 변경도 다음 병합 대상으로 잡는다.
+        const verify = await readRemote(id);
+        const check = Store.merge(verify);
+        if(check.remoteNeedsPush){
+          const latest = Store.snapshot();
+          await gh('/gists/'+id, {method:'PATCH', body:JSON.stringify({files:{[FILE]:{content:JSON.stringify({v:1, app:APP.id, savedAt:Date.now(), data:latest.data, stamps:latest.stamps})}}})});
+        }
       }
       lastAt = Date.now(); Settings.set('syncAt', lastAt); setState('ok');
     }catch(e){ setState('err', e.message||String(e)); }
@@ -303,6 +337,10 @@ const AI = (()=>{
     document.dispatchEvent(new CustomEvent('aistate'));
   }
   const key = () => (Settings.get('apiKey','')||'').trim();
+  const openRouterKey = () => (Settings.get('openrouterKey','')||'').trim();
+  const provider = () => Settings.get('aiProvider','openrouter');
+  const model = () => Settings.get('model','claude-sonnet-5-5'); // 기존 Claude 모델(자료 조사 도구용)
+  const openRouterModel = () => Settings.get('openrouterModel','openrouter/free');
   /* API 오류를 알아듣기 쉬운 말로 */
   function explain(status, body){
     let msg = ''; try{ const j = JSON.parse(body); msg = (j.error && j.error.message) || ''; }catch(e){ msg = String(body||''); }
@@ -315,8 +353,10 @@ const AI = (()=>{
     if(/usage limit|spend limit/i.test(msg)) return '월 사용 한도에 도달했습니다. console.anthropic.com → Limits에서 한도를 올려 주세요.';
     return msg ? msg.slice(0,200) : '알 수 없는 오류';
   }
-  const model = () => Settings.get('model','claude-sonnet-5-5');
-  function mode(){ return sample ? 'claude' : key() ? 'api' : null; }
+  function mode(){
+    if(provider()==='openrouter') return openRouterKey() ? 'openrouter' : null;
+    return sample ? 'claude' : key() ? 'api' : null;
+  }
   async function readSSE(r, onText, signal){
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '', all = '';
     for(;;){
@@ -330,28 +370,112 @@ const AI = (()=>{
     }
     return all;
   }
+  async function readOpenRouterSSE(r, onText, signal){
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='', all='';
+    for(;;){
+      if(signal && signal.aborted) throw new DOMException('중지했습니다.','AbortError');
+      const {done,value}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true}); let i;
+      while((i=buf.indexOf('\n'))>=0){
+        const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
+        if(!line.startsWith('data:')) continue;
+        const raw=line.slice(5).trim(); if(!raw || raw==='[DONE]') continue;
+        let j; try{j=JSON.parse(raw);}catch(e){continue;}
+        const delta=j.choices && j.choices[0] && j.choices[0].delta;
+        const part=delta && delta.content;
+        if(typeof part==='string' && part){ all+=part; onText && onText(all); }
+        else if(Array.isArray(part)){ const t=part.map(x=>x.text||'').join(''); if(t){all+=t;onText&&onText(all);} }
+        if(j.error) throw new Error(j.error.message||'OpenRouter 응답 오류');
+      }
+    }
+    return all;
+  }
   /* write({system, prompt, onText, signal, maxTokens, tier}) → 전체 글 */
   async function write({system='', prompt, onText, signal, maxTokens=16000, tier='default'}){
     await probe();
+    if(provider()==='openrouter'){
+      if(!openRouterKey()) throw new Error('OpenRouter API 키가 없습니다. 설정에서 키를 저장해 주세요.');
+      const messages=[]; if(system) messages.push({role:'system',content:system}); messages.push({role:'user',content:prompt});
+      const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',signal,
+        headers:{'content-type':'application/json','Authorization':'Bearer '+openRouterKey(),'HTTP-Referer':location.origin,'X-OpenRouter-Title':'집회 준비 도우미'},
+        body:JSON.stringify({model:openRouterModel(),max_tokens:maxTokens,stream:true,messages})});
+      if(!r.ok){const t=await r.text();let msg=t;try{const j=JSON.parse(t);msg=j.error?.message||t;}catch(e){} throw new Error(`OpenRouter 오류 ${r.status} — ${String(msg).slice(0,240)}`);}
+      return readOpenRouterSSE(r,onText,signal);
+    }
     if(sample){
       try{ const r = await sample((system ? system+'\n\n' : '')+prompt, {modelTier:tier, cache:false, signal, onText:({text})=>onText && onText(text)}); return r.text; }
       catch(e){ const m = {not_granted:'Claude 사용을 허용하지 않으셨습니다.', rate_limited:'사용 한도에 걸렸습니다. 잠시 후 다시 해 보세요.'}[e && e.code]; throw new Error(m || (e && e.message) || '작성 중 오류'); }
     }
-    if(!key()) throw new Error('AI 연결이 없습니다. 설정에서 API 키를 넣어 주세요.');
+    if(!key()) throw new Error('Claude API 키가 없습니다. 설정에서 Claude 키를 넣어 주세요.');
     const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST', signal,
       headers:{'content-type':'application/json','x-api-key':key(),'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
       body: JSON.stringify({model:model(), max_tokens:maxTokens, stream:true, system: system || undefined, messages:[{role:'user', content:prompt}]})});
     if(!r.ok){ const t = await r.text(); throw new Error(`API 오류 ${r.status} — ` + explain(r.status, t)); }
     return readSSE(r, onText, signal);
   }
-  async function test(k, m){
+  /* jw.org 온라인 라이브러리 조사: OpenRouter의 서버측 web_fetch 사용 */
+  async function research({prompt, maxTokens=12000, domains=['wol.jw.org','www.jw.org'], maxUses=10}={}){
+    if(provider()==='openrouter'){
+      const k=openRouterKey();
+      if(!k) throw new Error('OpenRouter API 키가 없습니다. 설정에서 OpenRouter 키를 저장해 주세요.');
+      const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{
+        method:'POST',
+        headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-OpenRouter-Title':'집회 준비 도우미'},
+        body:JSON.stringify({
+          model:openRouterModel(),
+          max_tokens:maxTokens,
+          messages:[{role:'user',content:prompt}],
+          tools:[{type:'openrouter:web_fetch',parameters:{
+            engine:'openrouter',
+            allowed_domains:domains,
+            max_uses:maxUses,
+            max_content_tokens:30000
+          }}]
+        })
+      });
+      if(!r.ok){
+        const t=await r.text(); let msg=t;
+        try{const j=JSON.parse(t);msg=j.error?.message||j.message||t;}catch(e){}
+        if(r.status===402) throw new Error('OpenRouter 잔액 또는 웹 가져오기 사용 조건을 확인해 주세요. 무료 모델 사용과 웹 자료 가져오기는 별도일 수 있습니다.');
+        if(/tool|function|unsupported/i.test(msg)) throw new Error('선택한 무료 모델이 웹 자료 가져오기 도구를 지원하지 않을 수 있습니다. 도구 호출을 지원하는 모델로 바꾸어 다시 시도해 주세요.');
+        throw new Error(`OpenRouter 조사 오류 ${r.status} — ${String(msg).slice(0,260)}`);
+      }
+      const j=await r.json();
+      const msg=j.choices?.[0]?.message;
+      let out=msg?.content||'';
+      if(Array.isArray(out)) out=out.map(x=>x.text||'').join('');
+      if(!out && msg?.tool_calls?.length) throw new Error('웹 자료를 가져왔지만 최종 답변을 받지 못했습니다. 다시 시도해 주세요.');
+      if(!out) throw new Error('OpenRouter가 조사 결과를 반환하지 않았습니다.');
+      return String(out);
+    }
+    const k=key();
+    if(!k) throw new Error('Claude를 선택한 경우에는 Claude API 키가 필요합니다.');
+    const tools=[{type:'web_fetch_20250910',name:'web_fetch',max_uses:maxUses,allowed_domains:domains}];
+    const messages=[{role:'user',content:prompt}]; let out='';
+    for(let turn=0;turn<5;turn++){
+      const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+        headers:{'content-type':'application/json','x-api-key':k,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+        body:JSON.stringify({model:model(),max_tokens:maxTokens,tools,messages})});
+      if(!r.ok) throw new Error('Claude API 오류 '+r.status+' — '+explain(r.status,await r.text()));
+      const j=await r.json();
+      out+=(j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
+      if(j.stop_reason!=='pause_turn') break;
+      messages.push({role:'assistant',content:j.content});
+    }
+    return out;
+  }
+  async function test(k, m, p='openrouter'){
+    if(p==='openrouter'){
+      const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-OpenRouter-Title':'집회 준비 도우미'},body:JSON.stringify({model:m||'openrouter/free',max_tokens:8,messages:[{role:'user',content:'안녕. 짧게 인사해 주세요.'}]})});
+      if(!r.ok){const t=await r.text();let msg=t;try{const j=JSON.parse(t);msg=j.error?.message||t;}catch(e){}throw new Error(`오류 ${r.status} — ${String(msg).slice(0,240)}`);} return true;
+    }
     const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
       headers:{'content-type':'application/json','x-api-key':k,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
       body: JSON.stringify({model:m, max_tokens:5, messages:[{role:'user', content:'안녕'}]})});
     if(!r.ok){ const t = await r.text(); throw new Error(`오류 ${r.status} — ` + explain(r.status, t)); }
     return true;
   }
-  return {probe, mode, write, test, model, explain};
+  return {probe, mode, write, research, test, model, openRouterModel, provider, explain};
 })();
 
 /* =========================================================
@@ -727,9 +851,34 @@ function libDb(){
 async function libTx(mode, fn){
   const db = await libDb();
   return new Promise((res,rej)=>{
-    const tx = db.transaction('files', mode), st = tx.objectStore('files');
-    const out = fn(st); tx.oncomplete = ()=>res(out && out.result); tx.onerror = ()=>rej(tx.error);
+    let out;
+    try{ const tx = db.transaction('files', mode), st = tx.objectStore('files');
+      out = fn(st);
+      tx.oncomplete = ()=>{ db.close(); res(out && out.result); };
+      tx.onerror = ()=>{ const err=tx.error||new Error('자료 저장 중 오류'); db.close(); rej(err); };
+      tx.onabort = ()=>{ const err=tx.error||new Error('자료 저장이 취소되었습니다'); db.close(); rej(err); };
+    }catch(e){ db.close(); rej(e); }
   });
+}
+async function libMergeFiles(incoming){
+  if(!Array.isArray(incoming) || !incoming.length) return {added:0, renamed:0, skipped:0};
+  const existing = await libTx('readonly', st=>st.getAll());
+  const byName = new Map((existing||[]).map(f=>[f.name,f]));
+  const writes = []; let added=0, renamed=0, skipped=0;
+  for(const raw of incoming){
+    if(!raw || !raw.name || !Array.isArray(raw.arts)) continue;
+    const item = {name:String(raw.name), src:String(raw.src||raw.name), arts:raw.arts};
+    const old = byName.get(item.name);
+    if(!old){ writes.push(item); byName.set(item.name,item); added++; continue; }
+    if(JSON.stringify(old.arts)===JSON.stringify(item.arts) && old.src===item.src){ skipped++; continue; }
+    const base = item.name.replace(/(\.[^.]+)$/,'');
+    const ext = (item.name.match(/(\.[^.]+)$/)||[])[1]||'';
+    let n=1, candidate;
+    do{ candidate = `${base} (백업 가져옴${n>1?' '+n:''})${ext}`; n++; }while(byName.has(candidate));
+    item.name=candidate; writes.push(item); byName.set(candidate,item); added++; renamed++;
+  }
+  if(writes.length) await libTx('readwrite', st=>{ writes.forEach(f=>st.put(f)); });
+  return {added, renamed, skipped};
 }
 async function libLoad(){
   try{
@@ -756,7 +905,9 @@ async function unzip(buf){
       const start = lo + 30 + dv.getUint16(lo+26, true) + dv.getUint16(lo+28, true);
       const data = u8.subarray(start, start+csize);
       if(method === 0) return dec.decode(data);
-      return await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+      if(typeof DecompressionStream==='undefined') throw new Error('현재 브라우저는 EPUB 압축 해제를 지원하지 않습니다. Chrome 또는 Edge 최신 버전에서 다시 시도하거나 TXT 파일을 사용해 주세요.');
+      try{ return await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text(); }
+      catch(err){ throw new Error('EPUB 압축을 풀지 못했습니다. 브라우저를 최신 버전으로 업데이트하거나 TXT 파일을 사용해 주세요.'); }
     });
     p += 46 + nl + xl + cl;
   }
@@ -829,7 +980,6 @@ function extractPubRefs(text){
 const Research = {
   /* 출판물 참조: 그 주 집회 교재 페이지(wol)에서 해당 순서의 「」 참조 링크를 따라가 요점을 정리 */
   async pubRefs(pubs, ctx={}, onStatus){
-    const key = (Settings.get('apiKey','')||'').trim(); if(!key) throw new Error('출판물 참조를 가져오려면 설정에서 API 키를 넣어 주세요.');
     const page = ctx.weekId ? WOL.meetingsUrl(ctx.weekId) : '';
     if(!pubs.length && !page) return [];
     onStatus && onStatus(`출판물 참조 조사 중… (${pubs.length ? pubs.length+'개' : '교재 페이지에서 찾는 중'}, 1-2분 걸릴 수 있음)`);
@@ -844,18 +994,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
 - link: 연 페이지 주소
 열지 못한 참조는 points를 "열지 못함"으로 쓰십시오. 페이지에 없는 내용은 지어내지 마십시오.
 설명 없이 JSON 배열 하나만 출력하십시오: [{"ref":"…","title":"…","points":"…","scriptures":"…","link":"…"}]`;
-    const tools = [{type:'web_fetch_20250910', name:'web_fetch', max_uses:Math.min(pubs.length*2+3, 12), allowed_domains:['wol.jw.org','www.jw.org']}];
-    const messages = [{role:'user', content:prompt}]; let text = '';
-    for(let turn=0; turn<5; turn++){
-      const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
-        headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body: JSON.stringify({model:AI.model(), max_tokens:8000, tools, messages})});
-      if(!r.ok) throw new Error('API 오류 '+r.status+' — '+AI.explain(r.status, await r.text()));
-      const j = await r.json();
-      text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
-      if(j.stop_reason !== 'pause_turn') break;
-      messages.push({role:'assistant', content:j.content});
-    }
+    const text = await AI.research({prompt, maxTokens:8000, domains:['wol.jw.org','www.jw.org'], maxUses:Math.min(pubs.length*2+3,12)});
     const a = text.indexOf('['), b = text.lastIndexOf(']'); let list = [];
     try{ list = JSON.parse(text.slice(a, b+1)); }catch(e){ throw new Error('출판물 참조 응답을 읽지 못했습니다.'); }
     return list.filter(x=>x && x.ref).map(x=>{ const ok = !/열지 못함/.test(String(x.points||''));
@@ -864,9 +1003,10 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
   },
   /* 연구 노트: Anthropic API의 web_fetch로 연구용 성경 장 페이지를 읽어 해당 절만 정리 */
   async studyNotes(refs, onStatus){
-    const key = (Settings.get('apiKey','')||'').trim(); if(!key) throw new Error('연구 노트를 가져오려면 설정에서 API 키를 넣어 주세요.');
     refs = [...new Set(refs)].slice(0, 8);
-    const urls = [...new Set(refs.map(rf=>{ const m = rf.match(/^(.+?)\s(\d{1,3}):/); const bn = m && bookNo(m[1]); return bn ? `https://wol.jw.org/ko/wol/b/r8/lp-ko/nwtsty/${bn}/${m[2]}` : null; }).filter(Boolean))];
+    const urlForRef = rf=>{ const m = rf.match(/^(.+?)\s(\d{1,3}):/); const bn = m && bookNo(m[1]); return bn ? `https://wol.jw.org/ko/wol/b/r8/lp-ko/nwtsty/${bn}/${m[2]}` : ''; };
+    const urlByRef = new Map(refs.map(rf=>[rf,urlForRef(rf)]));
+    const urls = [...new Set([...urlByRef.values()].filter(Boolean))];
     if(!urls.length) return [];
     onStatus && onStatus(`연구 노트 조사 중… (성구 ${refs.length}개, 1-2분 걸릴 수 있음)`);
     const prompt = `다음 연구용 성경(신세계역 연구용) 장 페이지들을 web_fetch로 열어, 아래 성구 각각에 대해 그 페이지에 실린 내용만 정리하십시오.
@@ -879,23 +1019,12 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
 - xrefs: 상호 참조 성구
 페이지에 없는 내용은 쓰지 마십시오. 없으면 "없음"이라고 쓰십시오.
 설명 없이 JSON 배열 하나만 출력하십시오: [{"ref":"요한복음 1:2","verse":"…","notes":"…","guide":"…","xrefs":"…"}]`;
-    const tools = [{type:'web_fetch_20250910', name:'web_fetch', max_uses:Math.min(urls.length+2, 10), allowed_domains:['wol.jw.org','www.jw.org']}];
-    const messages = [{role:'user', content:prompt}]; let text = '';
-    for(let turn=0; turn<4; turn++){
-      const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
-        headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body: JSON.stringify({model:AI.model(), max_tokens:8000, tools, messages})});
-      if(!r.ok) throw new Error('API 오류 '+r.status+' — '+AI.explain(r.status, await r.text()));
-      const j = await r.json();
-      text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
-      if(j.stop_reason !== 'pause_turn') break;
-      messages.push({role:'assistant', content:j.content});
-    }
+    const text = await AI.research({prompt, maxTokens:8000, domains:['wol.jw.org','www.jw.org'], maxUses:Math.min(urls.length+2,10)});
     const a = text.indexOf('['), b = text.lastIndexOf(']'); let list = [];
     try{ list = JSON.parse(text.slice(a, b+1)); }catch(e){ throw new Error('연구 노트 응답을 읽지 못했습니다.'); }
     return list.filter(x=>x && x.ref).map(x=>({id:'study-'+x.ref, kind:'study', title:`${x.ref} — 연구 노트·연구 자료 찾아보기`, source:'연구용 성경',
       text:[x.verse && x.verse!=='없음' ? `[본문] ${x.verse}` : '', `[연구 노트] ${x.notes||'없음'}`, `[연구 자료 찾아보기] ${x.guide||'-'}`, `[상호 참조] ${x.xrefs||'-'}`].filter(Boolean).join('\n'),
-      link:urls[0], checked:!/^없음/.test(String(x.notes||'').trim())}));
+      link:urlByRef.get(x.ref) || urls[0] || '', checked:!/^없음/.test(String(x.notes||'').trim())}));
   },
   async verses(refs){
     const out = [];
@@ -981,7 +1110,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
           <div><label>핵심어 (쉼표로 구분)</label><input type="text" data-k="kws" value="${esc(st.kws.join(', '))}" placeholder="예: 부활, 희망"></div>
         </div>
         ${pubOn ? `<label>출판물 참조 (; 로 구분 — 비워 두면 교재 페이지에서 찾음)</label><input type="text" data-k="pubs" value="${esc(st.pubs.join('; '))}" placeholder="예: 「파17.10」 23면 9-10항; 「예레」 29면">` : ''}
-        <div class="rops">${[['verses','성구 본문'], ...(pubOn ? [['pubs','출판물 참조'+(apiOn?'':' (API 키 필요)')]] : []), ['study','연구 노트'+(apiOn?'':' (API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${(k==='study'||k==='pubs')&&!apiOn?'disabled':''}> ${t}</label>`).join('')}</div>
+        <div class="rops">${[['verses','성구 본문'], ...(pubOn ? [['pubs','출판물 참조'+(apiOn?'':' (Claude API 키 필요)')]] : []), ['study','연구 노트'+(apiOn?'':' (Claude API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${(k==='study'||k==='pubs')&&!apiOn?'disabled':''}> ${t}</label>`).join('')}</div>
         <div class="row" style="margin-top:6px"><button class="btn" data-act="run">🔎 조사하기</button>${st.items.length?`<span class="st" style="margin:0">${st.items.filter(i=>i.checked).length}개 선택됨 — 체크한 자료만 AI 작성에 쓰입니다.</span>`:''}</div>
         <div class="st" data-k="status">${saved && saved.at ? '마지막 조사: '+fmtTime(saved.at) : ''}</div>
         ${groups}`;
@@ -995,12 +1124,18 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
         st.kws = csv($('[data-k=kws]', box).value);
         if($('[data-k=pubs]', box)) st.pubs = $('[data-k=pubs]', box).value.split(';').map(x=>x.trim()).filter(Boolean);
         const btn = e.currentTarget, stEl = $('[data-k=status]', box); btn.disabled = true; stEl.className = 'st';
-        const {items, errs} = await this.run({refs:st.refs, kws:st.kws, pubs:pubOn ? st.pubs : [], ctx:pubOn ? ctx : null}, opts, m=>stEl.textContent = m);
-        st.items = items; Store.set('research', key, {refs:st.refs, kws:st.kws, pubs:st.pubs, items, at:Date.now(), title});
-        draw();
-        const s2 = $('[data-k=status]', box);
-        s2.className = 'st' + (errs.length ? ' err' : ' ok');
-        s2.textContent = `${items.length}개를 찾았습니다.` + (errs.length ? ' 일부 실패 — '+errs.join(' / ') : '') + (!items.length && !errs.length ? ' 성구나 핵심어를 바꿔 보세요.' : '');
+        try{
+          const {items, errs} = await this.run({refs:st.refs, kws:st.kws, pubs:pubOn ? st.pubs : [], ctx:pubOn ? ctx : null}, opts, m=>{ const live=$('[data-k=status]',box); if(live) live.textContent=m; });
+          st.items = items; Store.set('research', key, {refs:st.refs, kws:st.kws, pubs:st.pubs, items, at:Date.now(), title});
+          draw();
+          const s2 = $('[data-k=status]', box);
+          s2.className = 'st' + (errs.length ? ' err' : ' ok');
+          s2.textContent = `${items.length}개를 찾았습니다.` + (errs.length ? ' 일부 실패 — '+errs.join(' / ') : '') + (!items.length && !errs.length ? ' 성구나 핵심어를 바꿔 보세요.' : '');
+        }catch(err){
+          const live=$('[data-k=status]',box); if(live){ live.className='st err'; live.textContent='조사 중 오류: '+(err.message||String(err)); }
+        }finally{
+          const liveBtn=$('[data-act=run]',box); if(liveBtn) liveBtn.disabled=false;
+        }
       };
     };
     draw();
@@ -1372,7 +1507,7 @@ let prAbort = null, prRec = null, prChunks = [], prTimer = null;
 
 /* =========================================================
    5-7. jw.org 온라인 라이브러리(WOL)에서 주간 자료 가져오기
-   브라우저는 wol.jw.org를 직접 읽을 수 없어서, Claude API의 web_fetch로 그 주의 ‘집회’ 페이지를 열고
+   브라우저는 wol.jw.org를 직접 읽을 수 없어서, AI 제공자의 web_fetch 도구로 그 주의 ‘집회’ 페이지를 열고
    생활과 봉사 집회 교재·파수대 연구 기사를 D:\JW 파일과 같은 글 형식으로 받아 온다.
    ========================================================= */
 const WOL = {
@@ -1380,8 +1515,6 @@ const WOL = {
     const y0 = new Date(Date.UTC(x.getUTCFullYear(), 0, 1)); return {y:x.getUTCFullYear(), w:Math.ceil(((x - y0)/86400000 + 1)/7)}; },
   meetingsUrl(id){ const {y, w} = this.isoWeek(new Date(id+'T00:00:00')); return `https://wol.jw.org/ko/wol/meetings/r8/lp-ko/${y}/${w}`; },
   async fetchWeek(id, {mwb=true, wt=true} = {}, onStatus){
-    const key = (Settings.get('apiKey','')||'').trim();
-    if(!key) throw new Error('jw.org에서 가져오려면 설정에서 Anthropic API 키를 넣어 주세요.');
     const url = this.meetingsUrl(id), label = Weeks.labelOf(id);
     const want = [mwb ? '생활과 봉사 집회 교재' : '', wt ? '「파수대」 연구 기사' : ''].filter(Boolean).join('와 ');
     const prompt = `다음은 jw.org 온라인 라이브러리의 ${label} 집회 페이지입니다: ${url}
@@ -1401,20 +1534,8 @@ ${mwb ? `===집회교재===
 연 페이지 주소들
 
 페이지를 열 수 없으면 ===오류=== 아래에 이유를 쓰십시오.`;
-    const tools = [{type:'web_fetch_20250910', name:'web_fetch', max_uses:5, allowed_domains:['wol.jw.org']}];
-    const messages = [{role:'user', content:prompt}]; let text = '';
-    for(let turn=0; turn<5; turn++){
-      onStatus && onStatus(turn ? `jw.org에서 이어서 가져오는 중… (${turn+1})` : 'jw.org 온라인 라이브러리에서 가져오는 중… (1-2분)');
-      const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
-        headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body: JSON.stringify({model:AI.model(), max_tokens:32000, tools, messages})});
-      if(!r.ok) throw new Error('API 오류 '+r.status+' — '+AI.explain(r.status, await r.text()));
-      const j = await r.json();
-      text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
-      if(j.stop_reason === 'pause_turn'){ messages.push({role:'assistant', content:j.content}); continue; }
-      if(j.stop_reason === 'max_tokens'){ messages.push({role:'assistant', content:j.content}); messages.push({role:'user', content:'끊긴 곳부터 이어서 계속 옮겨 주십시오.'}); continue; }
-      break;
-    }
+    onStatus && onStatus('OpenRouter로 jw.org 온라인 라이브러리에서 가져오는 중… (1-2분)');
+    const text = await AI.research({prompt, maxTokens:32000, domains:['wol.jw.org'], maxUses:5});
     WOL.lastRaw = text;
     /* 마크다운(##, **, - ) 표시를 걷어 내고, 표시줄(===…===)의 모양이 조금 달라도 찾는다 */
     const md = s => String(s).replace(/\r/g,'').split('\n').map(l=>l.replace(/^\s*#{1,6}\s*/,'').replace(/^\s*>\s?/,'').replace(/\*\*|__/g,'').replace(/^\s*[-•]\s+(?=\S)/,'  ').replace(/^\s*\*\s+/,'  ').replace(/^(\d{1,2})\)\s/,'$1. ')).filter(l=>!/^\s*(-{3,}|={3,}|`{3,}.*)\s*$/.test(l)).join('\n');
@@ -1466,7 +1587,7 @@ const Views = {
     const ai = AI.mode(), sync = Sync.status();
     const setup = (!ai || sync.state==='off') ? `<details class="more" style="margin-bottom:14px"><summary>👋 처음 설정 (${[ai, sync.state!=='off'].filter(Boolean).length}/2 완료)</summary>
         <ul class="plan" style="margin-top:6px">
-          <li><span class="ic">${ai?'✅':'1️⃣'}</span><div><b>AI 연결</b><span>설정에서 Anthropic API 키를 저장합니다.</span></div></li>
+          <li><span class="ic">${ai?'✅':'1️⃣'}</span><div><b>AI 연결</b><span>설정에서 OpenRouter 무료 API 키를 저장합니다. (jw.org 자동 조사에는 Claude 키도 필요합니다.)</span></div></li>
           <li><span class="ic">${sync.state!=='off'?'✅':'2️⃣'}</span><div><b>기기 간 동기화</b><span>GitHub 토큰을 넣으면 폰·태블릿·PC가 같은 내용을 봅니다.</span></div></li>
         </ul><div class="row"><a class="btn sm" href="#settings">설정 열기</a></div></details>` : '';
     const wolTarget = id || Weeks.thisId();
@@ -1934,13 +2055,25 @@ const Views = {
     const mountR = () => { const i = +$('#rSec').value, s = t.sections[i] || {title:'', points:''};
       Research.mount($('#talkR', el), `talk:${t.id}#${i}`, {refs:[...new Set(extractScriptures(s.points))], kws:keywordsOfText(s.title+' '+s.points, 6), title:`${t.topic} ${i+1}. ${s.title}`}); };
     $('#rSec').onchange = mountR; mountR();
-    $('#rAll').onclick = async e=>{ const b = e.currentTarget, st = $('#rAllSt'); b.disabled = true;
+    $('#rAll').onclick = async e=>{ const b = e.currentTarget, st = $('#rAllSt'); b.disabled = true; st.className='st';
       const apiOn = !!(Settings.get('apiKey','')||'').trim();
       const opts = Object.assign({verses:true, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {}));
-      for(let i=0;i<t.sections.length;i++){ const s = t.sections[i]; const refs = [...new Set(extractScriptures(s.points))], kws = keywordsOfText(s.title+' '+s.points, 6);
-        const {items} = await Research.run({refs, kws}, opts, m=>st.textContent = `소재목 ${i+1}/${t.sections.length} — ${m}`);
-        Store.set('research', `talk:${t.id}#${i}`, {refs, kws, items, at:Date.now(), title:`${t.topic} ${i+1}. ${s.title}`}); }
-      st.className='st ok'; st.textContent = '모든 소재목 조사를 마쳤습니다.'; b.disabled = false; render(); };
+      let completed=0, failed=[];
+      try{
+        for(let i=0;i<t.sections.length;i++){
+          const sec = t.sections[i], refs = [...new Set(extractScriptures(sec.points))], kws = keywordsOfText(sec.title+' '+sec.points, 6);
+          try{
+            const result = await Research.run({refs, kws}, opts, m=>st.textContent = `소재목 ${i+1}/${t.sections.length} — ${m}`);
+            Store.set('research', `talk:${t.id}#${i}`, {refs, kws, items:result.items, at:Date.now(), title:`${t.topic} ${i+1}. ${sec.title}`});
+            if(result.errs.length) failed.push(`${i+1}번 소재목: ${result.errs.join(', ')}`);
+            completed++;
+          }catch(err){ failed.push(`${i+1}번 소재목: ${err.message||err}`); }
+        }
+        st.className = 'st'+(failed.length?' err':' ok');
+        st.textContent = `${completed}/${t.sections.length}개 소재목 조사를 마쳤습니다.`+(failed.length?' 일부 오류: '+failed.join(' / '):'');
+      }catch(err){ st.className='st err'; st.textContent='일괄 조사 중 오류: '+(err.message||String(err)); }
+      finally{ b.disabled=false; render(); }
+    };
 
     /* 작성 */
     const out = $('#spOut');
@@ -1983,6 +2116,7 @@ const Views = {
   },
   settings(el){
     const s = Settings, ai = AI.mode(), sync = Sync.status();
+    const conflictCount = Store.conflicts().length;
     const theme = s.get('theme','system'), fs = s.get('fontScale','1');
     const scan = Legacy.scanThisDevice(), scanC = Legacy.summarize(scan.meeting), scanN = Object.keys(scan.meeting).length;
     const lm = Store.get('meta','legacyMeetingImport'), ls = Store.get('meta','legacySpeechImport');
@@ -1990,31 +2124,46 @@ const Views = {
       <section class="hero"><div class="kicker">앱 설정</div><h1>설정</h1><p>AI 연결, 기기 간 동기화, 백업과 기존 데이터 가져오기를 여기서 관리합니다.</p><div class="big">⚙️</div></section>
 
       <div class="card" id="cardAI">
-        <h2>🤖 AI 연결 ${ai==='claude' ? '<span class="badge ok">claude.ai 계정</span>' : ai==='api' ? '<span class="badge ok">API 키</span>' : '<span class="badge soon">연결 안 됨</span>'}</h2>
-        <p class="desc">${ai==='claude' ? '지금은 claude.ai 안에서 열려 있어 내 Claude 계정으로 작성합니다. 밖(GitHub Pages·설치 앱)에서 쓰려면 아래에 API 키를 넣어 두세요.' : '모든 화면의 AI 작성에 같은 키를 씁니다. 키는 이 기기에만 저장되며 백업·동기화에 들어가지 않습니다.'}</p>
-        <label for="apiKey">Anthropic API 키</label>
+        <h2>🤖 AI 연결 ${ai==='openrouter' ? '<span class="badge ok">OpenRouter 연결됨</span>' : ai==='claude' ? '<span class="badge ok">claude.ai 계정</span>' : ai==='api' ? '<span class="badge ok">Claude API 연결됨</span>' : '<span class="badge soon">연결 안 됨</span>'}</h2>
+        <p class="desc">기본은 OpenRouter 무료 모델입니다. 필요할 때 Claude를 선택할 수 있습니다. 두 API 키는 각각 저장되므로 서로 지워지지 않습니다.</p>
+        <label for="aiProvider">기본 AI 서비스</label>
+        <select id="aiProvider"><option value="openrouter">OpenRouter — 무료 모델 기본</option><option value="claude">Claude — 기존 방식</option></select>
+        <label for="openrouterKey">OpenRouter API 키</label>
+        <input id="openrouterKey" type="password" autocomplete="off" placeholder="sk-or-v1-..." value="${esc(s.get('openrouterKey',''))}">
+        <label for="openrouterModel">OpenRouter 모델</label>
+        <select id="openrouterModel"><option value="openrouter/free">무료 모델 자동 선택 (권장)</option></select>
+        <details class="more"><summary>OpenRouter 무료 API 키 받기</summary><ol class="desc" style="margin:8px 0 0;padding-left:18px">
+          <li><a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter API Keys</a>에 로그인합니다.</li>
+          <li>Create Key를 눌러 키를 만든 다음 복사합니다.</li>
+          <li>위 칸에 붙여넣고 저장한 뒤 연결 테스트를 누릅니다.</li>
+          <li>무료 모델은 사용량 제한이 있으며, 무료 모델 자동 선택은 그때 이용 가능한 무료 모델로 연결합니다.</li></ol></details>
+        <div class="divider"></div>
+        <label for="apiKey">Claude API 키 (선택)</label>
         <input id="apiKey" type="password" autocomplete="off" placeholder="sk-ant-..." value="${esc(s.get('apiKey',''))}">
-        <label for="model">모델</label>
+        <label for="model">Claude 모델</label>
         <select id="model">
-          <option value="claude-sonnet-5-5">Sonnet 5.5 — 정확하고 빠름 (권장)</option>
+          <option value="claude-sonnet-5-5">Sonnet 5.5 — 정확하고 빠름</option>
           <option value="claude-opus-5-5">Opus 5.5 — 더 정교함 (비용 높음)</option>
-          <option value="claude-haiku-5-5">Haiku 5.5 — 저렴하고 빠름</option>
+          <option value="claude-haiku-5-5">Haiku 5.5 — 빠르고 가벼움</option>
         </select>
-        <div class="row"><button class="btn" id="aiSave">저장</button><button class="btn ghost" id="aiTest">연결 테스트</button><button class="btn danger" id="aiClear">키 지우기</button></div>
+        <details class="more"><summary>Claude API 키 받는 방법</summary><ol class="desc" style="margin:8px 0 0;padding-left:18px">
+          <li><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> → API Keys → Create Key</li>
+          <li>키는 sk-ant-로 시작합니다. Claude API는 Claude 구독과 별도 요금입니다.</li></ol></details>
+        <p class="desc">jw.org·온라인 라이브러리 자동 조사도 OpenRouter의 웹 자료 가져오기 기능을 사용합니다. OpenRouter를 선택하면 Claude API 키 없이 조사할 수 있습니다. 웹 가져오기 기능의 사용 조건·요금은 무료 모델 사용량과 별도로 적용될 수 있습니다.</p>
+        <div class="row"><button class="btn" id="aiSave">저장</button><button class="btn ghost" id="aiTest">선택한 서비스 연결 테스트</button><button class="btn danger" id="aiClear">선택한 키 지우기</button></div>
         <div class="st" id="aiSt"></div>
-        <details class="more"><summary>API 키 받는 방법</summary><ol class="desc" style="margin:8px 0 0;padding-left:18px">
-          <li><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>에 로그인 → API Keys → Create Key</li>
-          <li>sk-ant-로 시작하는 키를 복사해 위 칸에 붙여넣고 ‘저장’ → ‘연결 테스트’</li>
-          <li>API는 Claude 구독과 별도로 사용량만큼 요금이 나옵니다.</li></ol></details>
       </div>
 
       <div class="card" id="cardSync">
         <h2>☁️ 기기 간 동기화 (GitHub Gist) ${sync.state==='ok' ? '<span class="badge ok">연결됨</span>' : sync.state==='err' ? '<span class="badge soon">오류</span>' : ''}</h2>
-        <p class="desc">폰·태블릿·PC가 같은 내용을 보도록 내 GitHub 계정의 <b>비공개 Gist</b> 한 개에 저장합니다. 항목마다 더 나중에 고친 내용이 남습니다.</p>
+        <p class="desc">폰·태블릿·PC가 집회 기록과 조사 결과를 함께 보도록 내 GitHub 계정의 <b>비공개 Gist</b> 한 개에 저장합니다. 같은 시각에 서로 다르게 수정된 기록은 충돌 보관함에 남깁니다. ‘내 자료’에 넣은 원본 파일은 용량이 클 수 있어 자동 동기화 대상이 아니며, 전체 백업 파일에 포함됩니다.</p>
         <label for="ghToken">GitHub 토큰 (gist 권한)</label>
         <input id="ghToken" type="password" autocomplete="off" placeholder="ghp_… 또는 github_pat_…" value="${esc(s.get('ghToken',''))}">
         <div class="row"><button class="btn" id="syncConnect">연결</button><button class="btn ghost" id="syncNow" ${Sync.token()?'':'disabled'}>지금 동기화</button><button class="btn danger" id="syncOff" ${Sync.token()?'':'disabled'}>연결 해제</button></div>
         <div class="st" id="syncSt">${sync.state==='ok' ? '마지막 동기화: '+fmtTime(sync.lastAt) : sync.state==='err' ? '오류: '+esc(sync.err) : sync.state==='busy' ? '동기화 중…' : '연결되지 않았습니다. 이 기기에만 저장됩니다.'}</div>
+        <div class="note">서로 다른 기기에서 같은 항목을 같은 시각에 수정한 내용은 자동으로 한쪽을 버리지 않고 충돌 보관함에 보존합니다. 현재 보관된 충돌: <b>${conflictCount}건</b>. 기기 날짜·시간은 ‘자동 설정’을 켜 두세요. 시계 차이가 크면 수정 순서 판단이 달라질 수 있습니다.
+          <div class="row" style="margin-top:8px"><button class="btn ghost sm" id="syncConflictExport" ${conflictCount?'':'disabled'}>충돌 자료 내려받기</button></div>
+        </div>
         <details class="more"><summary>토큰 만드는 방법</summary><ol class="desc" style="margin:8px 0 0;padding-left:18px">
           <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=jiphoe-hub" target="_blank" rel="noopener">여기</a>를 눌러 GitHub에 로그인 (권한은 gist 하나만 체크된 상태)</li>
           <li>맨 아래 ‘Generate token’ → 나온 토큰 복사 → 위 칸에 붙여넣고 ‘연결’</li>
@@ -2089,19 +2238,31 @@ const Views = {
         </ul>
         <p class="desc" style="margin-top:10px">버전 ${APP.version}</p>
       </div>`;
+    $('#aiProvider').value = s.get('aiProvider','openrouter');
     $('#model').value = s.get('model','claude-sonnet-5-5');
+    $('#openrouterModel').value = s.get('openrouterModel','openrouter/free');
 
     /* AI */
-    $('#aiSave').onclick = ()=>{ const k = $('#apiKey').value.trim(), st = $('#aiSt');
-      if(k && !/^sk-ant-/.test(k)){ st.className='st err'; st.textContent='키는 sk-ant- 로 시작해야 합니다.'; return; }
-      s.set('apiKey', k); s.set('model', $('#model').value); st.className='st ok'; st.textContent='저장했습니다.'; refreshPills(); };
-    $('#aiTest').onclick = async ()=>{ const k = $('#apiKey').value.trim() || s.get('apiKey',''), st = $('#aiSt');
-      if(!k){ st.className='st err'; st.textContent='먼저 키를 넣어 주세요.'; return; }
-      st.className='st'; st.textContent='확인 중…';
-      try{ await AI.test(k, $('#model').value); st.className='st ok'; st.textContent='연결 성공! 모든 화면에서 이 키를 씁니다.'; }
-      catch(e){ st.className='st err'; st.textContent='연결 실패: '+(e.message||'인터넷 연결을 확인하세요.')+(location.hostname.endsWith('claude.ai')||location.hostname.endsWith('claudeusercontent.com') ? ' (claude.ai 안에서는 API 접속이 막혀 있습니다)' : ''); } };
-    $('#aiClear').onclick = ()=>{ s.set('apiKey', null); $('#apiKey').value=''; const st=$('#aiSt'); st.className='st'; st.textContent='키를 지웠습니다.'; refreshPills(); };
+    $('#aiSave').onclick = ()=>{ const ok=$('#openrouterKey').value.trim(), ck=$('#apiKey').value.trim(), st=$('#aiSt');
+      if(ok && !/^sk-or-/.test(ok)){ st.className='st err'; st.textContent='OpenRouter 키 형식을 확인해 주세요. 보통 sk-or-로 시작합니다.'; return; }
+      if(ck && !/^sk-ant-/.test(ck)){ st.className='st err'; st.textContent='Claude 키는 sk-ant- 로 시작해야 합니다.'; return; }
+      s.set('openrouterKey',ok); s.set('apiKey',ck); s.set('aiProvider',$('#aiProvider').value);
+      s.set('openrouterModel',$('#openrouterModel').value); s.set('model',$('#model').value);
+      st.className='st ok'; st.textContent='저장했습니다. 선택한 서비스가 기본 AI로 사용됩니다.'; refreshPills(); };
+    $('#aiTest').onclick = async ()=>{ const p=$('#aiProvider').value, st=$('#aiSt');
+      const k=p==='openrouter' ? ($('#openrouterKey').value.trim()||s.get('openrouterKey','')) : ($('#apiKey').value.trim()||s.get('apiKey',''));
+      const m=p==='openrouter' ? $('#openrouterModel').value : $('#model').value;
+      if(!k){ st.className='st err'; st.textContent=p==='openrouter'?'OpenRouter 키를 먼저 입력해 주세요.':'Claude API 키를 먼저 입력해 주세요.'; return; }
+      st.className='st'; st.textContent='연결 확인 중…';
+      try{ await AI.test(k,m,p); st.className='st ok'; st.textContent='연결 성공! 저장을 누르면 선택한 서비스가 기본 AI가 됩니다.'; }
+      catch(e){ st.className='st err'; st.textContent='연결 실패: '+(e.message||'인터넷 연결을 확인하세요.'); } };
+    $('#aiClear').onclick = ()=>{ const p=$('#aiProvider').value, st=$('#aiSt');
+      if(p==='openrouter'){ s.set('openrouterKey',null); $('#openrouterKey').value=''; }
+      else { s.set('apiKey',null); $('#apiKey').value=''; }
+      st.className='st'; st.textContent=p==='openrouter'?'OpenRouter 키를 지웠습니다.':'Claude API 키를 지웠습니다.'; refreshPills(); };
+    $('#aiProvider').onchange = ()=>{ s.set('aiProvider',$('#aiProvider').value); };
     $('#model').onchange = ()=>s.set('model', $('#model').value);
+    $('#openrouterModel').onchange = ()=>s.set('openrouterModel', $('#openrouterModel').value);
 
     /* 동기화 */
     $('#syncConnect').onclick = async ()=>{ const t = $('#ghToken').value.trim(), st = $('#syncSt');
@@ -2125,20 +2286,39 @@ const Views = {
       st.className='st ok'; st.textContent = `${n}개를 가져왔습니다. (이름 배정 ${c.names} · 파수대 ${c.wt} · 영적 보물 ${c.gems} · 기타 ${c.other})`;
       $('#legacyBox').value=''; setTimeout(render, 1200); };
 
-    /* 백업 */
-    const backupText = () => JSON.stringify({app:APP.id, v:1, savedAt:Date.now(), ...Store.snapshot()});
-    $('#bkSave').onclick = ()=>{ const a = document.createElement('a'); const d = new Date();
-      a.href = URL.createObjectURL(new Blob([backupText()], {type:'application/json'}));
-      a.download = `집회준비_백업_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.json`;
-      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 3000); $('#bkSt').textContent='백업 파일을 저장했습니다.'; };
-    $('#bkCopy').onclick = async ()=>{ try{ await navigator.clipboard.writeText(backupText()); $('#bkSt').textContent='백업 글을 복사했습니다.'; }catch(e){ $('#bkSt').textContent='복사하지 못했습니다. ‘백업 파일 저장’을 쓰세요.'; } };
+    /* 백업: Store 자료 + IndexedDB의 내 자료를 함께 저장 */
+    const backupPayload = async()=>{
+      const snap=Store.snapshot(), libraryFiles=await libTx('readonly', st=>st.getAll());
+      return {...snap, app:APP.id, v:2, savedAt:Date.now(), library:{files:libraryFiles||[]}};
+    };
+    const backupText = async()=>JSON.stringify(await backupPayload());
+    $('#bkSave').onclick = async ()=>{ const st=$('#bkSt'); st.className='st'; st.textContent='집회 기록과 내 자료를 모으는 중…';
+      try{ const txt=await backupText(), a = document.createElement('a'), d = new Date();
+        a.href = URL.createObjectURL(new Blob([txt], {type:'application/json'}));
+        a.download = `집회준비_전체백업_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.json`;
+        document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 3000); st.className='st ok'; st.textContent='집회 기록과 내 자료를 포함한 전체 백업 파일을 저장했습니다.';
+      }catch(err){ st.className='st err'; st.textContent='백업을 만들지 못했습니다: '+(err.message||err); } };
+    $('#bkCopy').onclick = async ()=>{ const st=$('#bkSt'); st.className='st'; st.textContent='백업 글을 준비하는 중…';
+      try{ await navigator.clipboard.writeText(await backupText()); st.className='st ok'; st.textContent='집회 기록과 내 자료를 포함한 백업 글을 복사했습니다.'; }
+      catch(e){ st.className='st err'; st.textContent='복사하지 못했습니다. ‘백업 파일 저장’을 사용해 주세요.'; } };
     $('#bkLoad').onclick = ()=>$('#bkFile').click();
-    $('#bkFile').onchange = async e=>{ const f = e.target.files[0]; e.target.value=''; if(!f) return; const st = $('#bkSt');
+    $('#bkFile').onchange = async e=>{ const f = e.target.files[0]; e.target.value=''; if(!f) return; const st = $('#bkSt'); st.className='st'; st.textContent='백업을 확인하고 복원하는 중…';
       try{ const j = JSON.parse(await f.text());
         if(j.app==='jipoe-plan'){ const n = Legacy.importMeeting(j.data||{}, '파일'); st.className='st ok'; st.textContent=`집회 계획표 백업 ${n}개를 가져왔습니다.`; return; }
         if(j.app!==APP.id || !j.stamps){ st.className='st err'; st.textContent='이 앱의 백업 파일이 아닙니다.'; return; }
-        const {changedLocal} = Store.merge(j); st.className='st ok'; st.textContent=`백업과 합쳤습니다. 바뀐 항목 ${changedLocal}개 (더 나중에 고친 내용이 남습니다).`;
-      }catch(err){ st.className='st err'; st.textContent='파일을 읽지 못했습니다.'; } };
+        const {changedLocal, conflicts=0} = Store.merge(j);
+        let libMsg='';
+        if(j.library && Array.isArray(j.library.files)){
+          const r=await libMergeFiles(j.library.files);
+          libMsg=` 내 자료 ${r.added}개 추가${r.renamed?` (이름이 겹쳐 ${r.renamed}개는 별도 보관)`:''}, ${r.skipped}개 동일하여 건너뜀.`;
+          await libLoad();
+        }else libMsg=' 이 백업에는 내 자료가 포함되어 있지 않습니다(이전 버전 백업).';
+        st.className='st ok'; st.textContent=`백업을 합쳤습니다. 바뀐 기록 ${changedLocal}개, 새 충돌 ${conflicts}건.${libMsg}`;
+      }catch(err){ st.className='st err'; st.textContent='복원하지 못했습니다: '+(err.message||String(err)); } };
+    $('#syncConflictExport').onclick = ()=>{ const items=Store.conflicts(); if(!items.length) return;
+      const a=document.createElement('a'), d=new Date(); a.href=URL.createObjectURL(new Blob([JSON.stringify({app:APP.id, exportedAt:Date.now(), conflicts:items},null,2)],{type:'application/json'}));
+      a.download=`집회준비_동기화충돌_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}.json`; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),3000);
+    };
 
     /* 내 자료 */
     $('#libPick').onclick = ()=>$('#libFile').click();
@@ -2271,7 +2451,7 @@ function applyTheme(){
 }
 function refreshPills(){
   const m = AI.mode();
-  $('#aiPill').innerHTML = `<span class="dot ${m?'ok':'warn'}"></span>${m==='claude' ? 'AI: claude.ai 계정' : m==='api' ? 'AI: API 키' : 'AI 연결 안 됨'}`;
+  $('#aiPill').innerHTML = `<span class="dot ${m?'ok':'warn'}"></span>${m==='openrouter' ? 'AI: OpenRouter 무료 모델' : m==='claude' ? 'AI: claude.ai 계정' : m==='api' ? 'AI: Claude API' : 'AI 연결 안 됨'}`;
   const s = Sync.status();
   $('#syncPill').innerHTML = `<span class="dot ${s.state==='ok'?'ok':s.state==='err'?'bad':s.state==='busy'?'warn':''}"></span>${s.state==='ok' ? '동기화 '+fmtTime(s.lastAt) : s.state==='err' ? '동기화 오류' : s.state==='busy' ? '동기화 중…' : '동기화 꺼짐'}`;
   $('#topSync').textContent = s.state==='ok' ? '☁️' : s.state==='err' ? '⚠️' : s.state==='busy' ? '🔄' : '☁️';
@@ -2284,7 +2464,7 @@ window.addEventListener('hashchange', render);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 document.addEventListener('syncstate', ()=>{ refreshPills(); if(['week','settings'].includes(current) && !document.activeElement.matches('input,textarea')) render(); });
 document.addEventListener('aistate', ()=>{ refreshPills(); if(['week','settings'].includes(current)) render(); });
-Store.on(info=>{ if(info.remote && current==='week') render(); });
+Store.on(info=>{ if(info.remote && ['week','settings'].includes(current) && !document.activeElement.matches('input,textarea')) render(); });
 
 /* 앱을 새로 열 때 지난 주가 선택되어 있으면 이번 주로 돌아오기 */
 if((Settings.get('weekSel')||'') < Weeks.thisId()) Settings.set('weekSel', Weeks.thisId());
