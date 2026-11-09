@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.1 (jw.org 가져오기·날짜 자동)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.2 (날짜 바로잡기)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -200,7 +200,9 @@ const Store = (()=>{
   try{ const j = JSON.parse(LS.get(KEY, 'null')); if(j && j.data) db = Object.assign({v:1, data:{}, stamps:{}}, j); }catch(e){}
   const subs = new Set();
   let saveTimer = null;
-  const persist = () => { clearTimeout(saveTimer); saveTimer = setTimeout(()=>LS.set(KEY, JSON.stringify(db)), 150); };
+  const flush = () => { if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; LS.set(KEY, JSON.stringify(db)); } };
+  const persist = () => { clearTimeout(saveTimer); saveTimer = setTimeout(()=>{ saveTimer = null; LS.set(KEY, JSON.stringify(db)); }, 150); };
+  addEventListener('pagehide', flush); document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='hidden') flush(); });
   const emit = (info) => subs.forEach(fn=>{ try{ fn(info); }catch(e){ console.error(e); } });
   return {
     get(col, id, d=null){ const c = db.data[col]; return c && c[id] != null ? c[id] : d; },
@@ -400,8 +402,10 @@ const Weeks = {
     return this.ymd(this.monday(new Date(y, +m[1]-1, +m[2])));
   },
   ids(){ return Object.keys(Store.all('weeks')).sort(); },
+  /* 저장된 주 + 이번 주부터 앞으로 4주 (교재가 없어도 고를 수 있게) */
+  allIds(){ const s = new Set(this.ids()); const m = this.monday(); for(let k=0;k<5;k++){ const d = new Date(m); d.setDate(m.getDate()+7*k); s.add(this.ymd(d)); } return [...s].sort(); },
   get(id){ return Store.get('weeks', id); },
-  save(w){ w.updatedAt = Date.now(); Store.set('weeks', w.id, w); },
+  save(w){ w.updatedAt = Date.now(); w.label = this.labelOf(w.id); Store.set('weeks', w.id, w); },
   blank(id){
     return {id, label:this.labelOf(id), reading:'', songs:['','',''], chair:'', prayerOpen:'', prayerClose:'', note:'', parts:[
       {no:1, sec:'treasure', title:'', min:10, sub:'', detail:'', who:''},
@@ -1214,7 +1218,7 @@ function bindWeekBar(el, ids, id){
   $('[data-wk=prev]', el).onclick = ()=>go(ids[ids.indexOf(id)-1]);
   $('[data-wk=next]', el).onclick = ()=>go(ids[ids.indexOf(id)+1]);
 }
-function pickWeek(ids){ let id = Settings.get('weekSel') || Weeks.thisId(); if(!ids.includes(id)) id = ids.find(x=>x >= Weeks.thisId()) || ids[ids.length-1] || null; return id; }
+function pickWeek(ids){ let id = Settings.get('weekSel') || Weeks.thisId(); if(!ids.includes(id)) id = ids.includes(Weeks.thisId()) ? Weeks.thisId() : (ids.find(x=>x >= Weeks.thisId()) || ids[ids.length-1] || null); return id; }
 function legacyFor(label){
   const all = Store.all('legacyMeeting'), out = [];
   for(const k in all){ if(label && k.includes(label) && /_out_/.test(k) && all[k]) out.push({k, v:all[k]}); }
@@ -1342,16 +1346,16 @@ function planCard(items){
 }
 const Views = {
   week(el){
-    const ids = Weeks.ids();
+    const ids = Weeks.allIds();
     let id = Settings.get('weekSel') || Weeks.thisId();
-    if(!ids.includes(id)) id = ids.find(x=>x >= Weeks.thisId()) || ids[ids.length-1] || null;
+    if(!ids.includes(id)) id = Weeks.thisId();
     const ai = AI.mode(), sync = Sync.status();
     const setup = (!ai || sync.state==='off') ? `<details class="more" style="margin-bottom:14px"><summary>👋 처음 설정 (${[ai, sync.state!=='off'].filter(Boolean).length}/2 완료)</summary>
         <ul class="plan" style="margin-top:6px">
           <li><span class="ic">${ai?'✅':'1️⃣'}</span><div><b>AI 연결</b><span>설정에서 Anthropic API 키를 저장합니다.</span></div></li>
           <li><span class="ic">${sync.state!=='off'?'✅':'2️⃣'}</span><div><b>기기 간 동기화</b><span>GitHub 토큰을 넣으면 폰·태블릿·PC가 같은 내용을 봅니다.</span></div></li>
         </ul><div class="row"><a class="btn sm" href="#settings">설정 열기</a></div></details>` : '';
-    const wolTarget = Settings.get('weekSel') && !Weeks.get(Settings.get('weekSel')) ? Settings.get('weekSel') : Weeks.thisId();
+    const wolTarget = id || Weeks.thisId();
     const wolCard = `<div class="card"><h2>🌐 jw.org에서 가져오기</h2>
         <p class="desc">날짜를 고르면 jw.org 온라인 라이브러리에서 그 주의 생활과 봉사 집회 교재와 파수대 연구 기사를 가져옵니다. 날짜는 자동으로 맞춰지고, 이미 적은 이름 배정과 답변은 그대로 남습니다. (Claude API 키 필요 · 한 주에 1-2분)</p>
         <div class="row" style="margin-top:0"><input type="date" id="wolDate" value="${wolTarget}" style="max-width:190px">
@@ -1365,10 +1369,20 @@ const Views = {
           <button class="btn ghost" id="impPasteBtn">글 붙여넣기</button><button class="btn ghost" id="impOld">기존 임명표에서 가져오기</button></div>
         <div id="impPasteBox" hidden><textarea id="impPaste" placeholder="11월 9-15일&#10;예레미야 51-52장&#10;노래 98 및 기도 | 소개말 (1분)&#10;…"></textarea><div class="row"><button class="btn sm" id="impPasteGo">이 글로 만들기</button></div></div>
         <div class="st" id="impSt"></div></div>`;
-    if(!id){
-      el.innerHTML = `<section class="hero"><div class="kicker">주간 집회 준비</div><h1>이번 주</h1><p>집회 교재를 불러오면 주마다 집회 순서와 이름 배정, 순서지 인쇄를 한곳에서 할 수 있습니다.</p><div class="big">🗓️</div></section>${setup}${wolCard}${importCard}
-        <div class="card"><h2>➕ 빈 주 만들기</h2><p class="desc">교재 없이 이번 주를 직접 입력합니다.</p><div class="row" style="margin-top:0"><button class="btn ghost" id="addThis">이번 주 만들기</button></div></div>`;
-      bindImport(el); bindWol(el); $('#addThis').onclick = ()=>{ const w = Weeks.blank(Weeks.thisId()); Weeks.save(w); Settings.set('weekSel', w.id); render(); };
+    if(!Weeks.get(id)){
+      const ix = ids.indexOf(id);
+      el.innerHTML = `<section class="hero"><div class="kicker">${id===Weeks.thisId() ? '이번 주' : id < Weeks.thisId() ? '지난 주' : '다가오는 주'} · 평일 집회</div><h1>${esc(Weeks.labelOf(id))}</h1><p>이 주의 집회 교재가 아직 없습니다. jw.org에서 가져오거나 파일을 불러오세요.</p><div class="big">🗓️</div></section>${setup}
+        <div class="wkbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+          <button class="btn ghost sm" id="wPrev" ${ix<=0?'disabled':''}>◀</button>
+          <select id="wSel" style="flex:1;min-width:180px">${ids.map(x=>`<option value="${x}" ${x===id?'selected':''}>${esc(Weeks.labelOf(x))}${x===Weeks.thisId()?' (이번 주)':''}${Weeks.get(x)?'':' — 교재 없음'}</option>`).join('')}</select>
+          <button class="btn ghost sm" id="wNext" ${ix>=ids.length-1?'disabled':''}>▶</button>
+          ${id!==Weeks.thisId() ? '<button class="btn ghost sm" id="wToday">이번 주로</button>' : ''}</div>
+        ${wolCard}${importCard}
+        <div class="card"><h2>➕ 빈 주 만들기</h2><p class="desc">교재 없이 ${esc(Weeks.labelOf(id))}을 직접 입력합니다.</p><div class="row" style="margin-top:0"><button class="btn ghost" id="addThis">이 주 만들기</button></div></div>`;
+      const go = x => { Settings.set('weekSel', x); render(); };
+      $('#wSel').onchange = e=>go(e.target.value); $('#wPrev').onclick = ()=>go(ids[ix-1]); $('#wNext').onclick = ()=>go(ids[ix+1]);
+      if($('#wToday')) $('#wToday').onclick = ()=>go(Weeks.thisId());
+      bindImport(el); bindWol(el); $('#addThis').onclick = ()=>{ const w = Weeks.blank(id); Weeks.save(w); render(); };
       return;
     }
     const w = JSON.parse(JSON.stringify(Weeks.get(id)));
@@ -1413,13 +1427,13 @@ const Views = {
         .mybar{display:flex;gap:10px;align-items:center;background:var(--ok-soft);color:var(--ok);border-radius:12px;padding:10px 14px;margin-bottom:14px;font-weight:600}
         @media(max-width:860px){ .info{grid-template-columns:1fr 1fr} .prow{grid-template-columns:44px 1fr} .prow .who{grid-column:2} }
       </style>
-      <section class="hero"><div class="kicker">${isThis ? '이번 주' : id < Weeks.thisId() ? '지난 주' : '다가오는 주'} · 평일 집회</div><h1>${esc(w.label)}</h1><p>📖 ${esc(w.reading||'성경 읽기 범위 없음')} · 예상 시각 ${Settings.get('meetingStart','19:30')}–${tl.end}</p><div class="big">🗓️</div></section>
+      <section class="hero"><div class="kicker">${isThis ? '이번 주' : id < Weeks.thisId() ? '지난 주' : '다가오는 주'} · 평일 집회</div><h1>${esc(Weeks.labelOf(id))}</h1><p>📖 ${esc(w.reading||'성경 읽기 범위 없음')} · 예상 시각 ${Settings.get('meetingStart','19:30')}–${tl.end}</p><div class="big">🗓️</div></section>
       ${setup}
       <div class="wkbar">
         <button class="btn ghost sm" id="wPrev" ${i<=0?'disabled':''} aria-label="이전 주">◀</button>
-        <select id="wSel">${ids.map(x=>`<option value="${x}" ${x===id?'selected':''}>${esc((Weeks.get(x)||{}).label||x)}${x===Weeks.thisId()?' (이번 주)':''}</option>`).join('')}</select>
+        <select id="wSel">${ids.map(x=>`<option value="${x}" ${x===id?'selected':''}>${esc(Weeks.labelOf(x))}${x===Weeks.thisId()?' (이번 주)':''}${Weeks.get(x)?'':' — 교재 없음'}</option>`).join('')}</select>
         <button class="btn ghost sm" id="wNext" ${i>=ids.length-1?'disabled':''} aria-label="다음 주">▶</button>
-        ${!isThis && ids.includes(Weeks.thisId()) ? '<button class="btn ghost sm" id="wToday">이번 주로</button>' : ''}
+        ${!isThis ? '<button class="btn ghost sm" id="wToday">이번 주로</button>' : ''}
         <button class="btn sm" id="wPrint">🖨 순서지 인쇄</button>
         <button class="btn ghost sm" id="wEdit">${editing ? '✔ 편집 끝' : '✎ 순서 편집'}</button>
       </div>
@@ -1492,7 +1506,7 @@ const Views = {
     if($('#rTarget', el)){ const last = Settings.get('rTarget:'+w.id); if(last) $('#rTarget', el).value = last; $('#rTarget', el).onchange = ()=>{ Settings.set('rTarget:'+w.id, $('#rTarget', el).value); mountR(); }; mountR(); }
   },
   wt(el){
-    const ids = [...new Set([...Weeks.ids(), ...Object.keys(Store.all('wt'))])].sort();
+    const ids = [...new Set([...Weeks.allIds(), ...Object.keys(Store.all('wt'))])].sort();
     const id = pickWeek(ids);
     const a = id ? Store.get('wt', id) : null;
     const wolBtn = `<div class="card"><h2>🌐 jw.org에서 이 주 파수대 가져오기</h2><p class="desc">jw.org 온라인 라이브러리에서 ${esc(Weeks.labelOf(id||Weeks.thisId()))} 연구 기사를 가져옵니다. (Claude API 키 필요)</p>
@@ -2074,6 +2088,8 @@ document.addEventListener('syncstate', ()=>{ refreshPills(); if(['week','setting
 document.addEventListener('aistate', ()=>{ refreshPills(); if(['week','settings'].includes(current)) render(); });
 Store.on(info=>{ if(info.remote && current==='week') render(); });
 
+/* 앱을 새로 열 때 지난 주가 선택되어 있으면 이번 주로 돌아오기 */
+if((Settings.get('weekSel')||'') < Weeks.thisId()) Settings.set('weekSel', Weeks.thisId());
 applyTheme(); render(); refreshPills(); AI.probe(); if(Sync.token()) Sync.now();
 if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) addEventListener('load', ()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
 </script>
