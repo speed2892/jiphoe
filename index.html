@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.9 (낭독 성구 정리)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.1 (무료: 복사·붙여넣기)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -303,6 +303,18 @@ const AI = (()=>{
     document.dispatchEvent(new CustomEvent('aistate'));
   }
   const key = () => (Settings.get('apiKey','')||'').trim();
+  /* API 오류를 알아듣기 쉬운 말로 */
+  function explain(status, body){
+    let msg = ''; try{ const j = JSON.parse(body); msg = (j.error && j.error.message) || ''; }catch(e){ msg = String(body||''); }
+    if(/credit balance/i.test(msg)) return '크레딧(잔액)이 부족합니다. console.anthropic.com → Billing(결제)에서 충전한 뒤 다시 해 보세요.';
+    if(status===401 || /x-api-key|authentication/i.test(msg)) return '키가 맞지 않습니다. 키를 다시 복사해 넣어 주세요.';
+    if(status===403) return '이 키로는 사용할 수 없습니다 (권한·조직 설정 확인).';
+    if(status===404 || /model/i.test(msg) && /not.*found|invalid/i.test(msg)) return '모델을 찾지 못했습니다. 다른 모델을 골라 보세요.';
+    if(status===429) return '사용 한도에 걸렸습니다. 잠시 후 다시 해 보세요.';
+    if(status===529 || status>=500) return 'Anthropic 서버가 바쁩니다. 잠시 후 다시 해 보세요.';
+    if(/usage limit|spend limit/i.test(msg)) return '월 사용 한도에 도달했습니다. console.anthropic.com → Limits에서 한도를 올려 주세요.';
+    return msg ? msg.slice(0,200) : '알 수 없는 오류';
+  }
   const model = () => Settings.get('model','claude-sonnet-5-5');
   function mode(){ return sample ? 'claude' : key() ? 'api' : null; }
   async function readSSE(r, onText, signal){
@@ -329,17 +341,17 @@ const AI = (()=>{
     const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST', signal,
       headers:{'content-type':'application/json','x-api-key':key(),'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
       body: JSON.stringify({model:model(), max_tokens:maxTokens, stream:true, system: system || undefined, messages:[{role:'user', content:prompt}]})});
-    if(!r.ok){ const t = await r.text(); throw new Error(`API 오류 ${r.status}` + (r.status===401 ? ' — 키를 확인하세요.' : r.status===404 ? ' — 모델 이름을 확인하세요.' : r.status===429 ? ' — 잠시 후 다시 해 보세요.' : ': '+t.slice(0,200))); }
+    if(!r.ok){ const t = await r.text(); throw new Error(`API 오류 ${r.status} — ` + explain(r.status, t)); }
     return readSSE(r, onText, signal);
   }
   async function test(k, m){
     const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
       headers:{'content-type':'application/json','x-api-key':k,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
       body: JSON.stringify({model:m, max_tokens:5, messages:[{role:'user', content:'안녕'}]})});
-    if(!r.ok) throw new Error(r.status===401 ? '키가 맞지 않습니다.' : r.status===404 ? '모델을 찾지 못했습니다.' : '오류 '+r.status);
+    if(!r.ok){ const t = await r.text(); throw new Error(`오류 ${r.status} — ` + explain(r.status, t)); }
     return true;
   }
-  return {probe, mode, write, test, model};
+  return {probe, mode, write, test, model, explain};
 })();
 
 /* =========================================================
@@ -838,7 +850,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
       const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
         headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
         body: JSON.stringify({model:AI.model(), max_tokens:8000, tools, messages})});
-      if(!r.ok) throw new Error('API 오류 '+r.status+': '+(await r.text()).slice(0,200));
+      if(!r.ok) throw new Error('API 오류 '+r.status+' — '+AI.explain(r.status, await r.text()));
       const j = await r.json();
       text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
       if(j.stop_reason !== 'pause_turn') break;
@@ -873,7 +885,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
       const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
         headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
         body: JSON.stringify({model:AI.model(), max_tokens:8000, tools, messages})});
-      if(!r.ok) throw new Error('API 오류 '+r.status+': '+(await r.text()).slice(0,200));
+      if(!r.ok) throw new Error('API 오류 '+r.status+' — '+AI.explain(r.status, await r.text()));
       const j = await r.json();
       text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
       if(j.stop_reason !== 'pause_turn') break;
@@ -1396,7 +1408,7 @@ ${mwb ? `===집회교재===
       const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
         headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
         body: JSON.stringify({model:AI.model(), max_tokens:32000, tools, messages})});
-      if(!r.ok) throw new Error('API 오류 '+r.status+': '+(await r.text()).slice(0,200));
+      if(!r.ok) throw new Error('API 오류 '+r.status+' — '+AI.explain(r.status, await r.text()));
       const j = await r.json();
       text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
       if(j.stop_reason === 'pause_turn'){ messages.push({role:'assistant', content:j.content}); continue; }
@@ -1752,7 +1764,10 @@ const Views = {
       ${kind==='reading' ? `<div class="card"><h2>📜 낭독 본문</h2>${readTxt ? `<div class="scr">${esc(readTxt)}</div>` : `<p class="desc">${bible ? '본문에서 낭독 범위를 찾지 못했습니다.' : '성경범위 파일을 불러오면 낭독 본문이 여기에 나옵니다.'} (${esc(p.sub||'')})</p>`}</div>` : ''}
       <div class="card"><h2>📝 ${kind==='demo' ? '실연 예시 대본' : kind==='reading' ? '낭독 연습 도움말' : kind==='life' ? '진행 메모' : '연설문'}</h2>
         <p class="desc">이번 주 화면에서 이 순서를 자료 조사해 두었다면 체크한 자료가 함께 쓰입니다.</p>
-        <div class="row" style="margin-top:0"><button class="btn" id="prGo">✍️ 만들기</button><button class="btn danger" id="prStop" disabled>중지</button><button class="btn ghost" id="prCopy">복사</button></div><div class="st" id="prSt"></div>
+        <div class="row" style="margin-top:0"><button class="btn" id="prGo">✍️ 만들기</button><button class="btn danger" id="prStop" disabled>중지</button><button class="btn ghost" id="prCopy">복사</button></div>
+        <div class="row"><button class="btn ghost" id="prAsk">📋 요청 글 복사</button><a class="btn ghost" href="https://claude.ai/new" target="_blank" rel="noopener">💬 Claude 열기</a><button class="btn ghost" id="prPaste">📥 결과 붙여넣기</button></div>
+        <p class="desc" style="margin-top:4px">무료로 쓰기: ① 요청 글 복사 → ② Claude 채팅에 붙여넣고 보내기 → ③ 나온 연설문을 복사해 ‘결과 붙여넣기’ (API 키 필요 없음)</p>
+        <div class="st" id="prSt"></div>
         <textarea id="prScript" style="min-height:240px;margin-top:10px" placeholder="만든 내용이 여기에 나옵니다. 직접 고칠 수 있습니다.">${esc(pr.script||'')}</textarea></div>
       <div class="card"><h2>⏱️ 말하기 연습</h2>
         <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap"><div class="timer" id="prClock">0:00</div><span class="desc" style="margin:0">목표 ${p.min}분 · 30초 남으면 노랑, 넘으면 빨강</span></div>
@@ -1767,7 +1782,7 @@ const Views = {
     $('#prSel').onchange = e=>{ Settings.set('prPart:'+id, e.target.value); render(); };
     const sc = $('#prScript'); let tm; sc.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>save({script:sc.value}), 400); };
     const mine = $('#prMine'); let tm2; mine.oninput = ()=>{ clearTimeout(tm2); tm2 = setTimeout(()=>save({mine:mine.value}), 400); };
-    $('#prGo').onclick = async ()=>{ const st = $('#prSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+    $('#prGo').onclick = async ()=>{ const st = $('#prSt'); if(!AI.mode()){ st.className='st err'; st.textContent='API 키가 없습니다. 아래 ‘📋 요청 글 복사’로 Claude 채팅에서 무료로 만들 수 있습니다.'; return; }
       prAbort = new AbortController(); $('#prGo').disabled = true; $('#prStop').disabled = false; st.className='st'; st.textContent='작성 중…';
       try{
         const apiOn = !!(Settings.get('apiKey','')||'').trim();
@@ -1784,6 +1799,21 @@ const Views = {
       catch(e){ st.className='st err'; st.textContent = e.name==='AbortError' ? '중지했습니다.' : '오류: '+e.message; }
       $('#prGo').disabled = false; $('#prStop').disabled = true; prAbort = null; };
     $('#prStop').onclick = ()=>{ if(prAbort) prAbort.abort(); };
+    /* 무료 방법: 요청 글을 복사해 Claude 채팅에서 쓰기 */
+    $('#prAsk').onclick = async ()=>{
+      const mat = kind!=='reading' ? Research.materialText(prKey) : '';
+      const looked = !!mat && /교재의 출판물 참조 요점/.test(mat);
+      const extra = (kind!=='reading' && prPubs.length && !looked)
+        ? `\n\n# 먼저 할 일\n웹 검색으로 wol.jw.org(온라인 라이브러리)에서 다음 출판물 참조를 찾아, 그 면·항의 요점을 자신의 말로 간추려 연설에 반영하십시오: ${prPubs.join(' / ')}\n찾지 못한 참조는 제목만 언급하고 내용을 지어내지 마십시오.`
+        : '';
+      const txt = `${Practice.rules}\n\n${Practice.scriptPrompt(w, p, kind, mat + (readTxt ? `\n[낭독 본문]\n${readTxt}` : ''))}${extra}\n\n# 출력\n설명 없이 ${Practice.label[kind]} 원고만 출력하십시오.`;
+      const st = $('#prSt');
+      try{ await navigator.clipboard.writeText(txt); st.className='st ok'; st.textContent = `요청 글을 복사했습니다 (${txt.length.toLocaleString()}자). ‘💬 Claude 열기’를 눌러 채팅에 붙여넣고 보내세요.`; }
+      catch(e){ sc.value = txt; sc.select(); st.className='st'; st.textContent = '자동 복사가 안 되어 아래 칸에 넣었습니다. 전체 선택해 복사하세요.'; } };
+    $('#prPaste').onclick = async ()=>{ const st = $('#prSt');
+      try{ const t = (await navigator.clipboard.readText()||'').trim(); if(!t) throw new Error('empty');
+        sc.value = t; save({script:t}); st.className='st ok'; st.textContent = `붙여넣었습니다 — 약 ${t.length.toLocaleString()}자 (≈${(t.length/330).toFixed(1)}분)`; }
+      catch(e){ sc.value = ''; sc.focus(); st.className='st'; st.textContent = '아래 칸을 길게 눌러 ‘붙여넣기’ 하세요. 자동으로 저장됩니다.'; } };
     $('#prCopy').onclick = async ()=>{ try{ await navigator.clipboard.writeText(sc.value); toast('복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
     /* 타이머 */
     let secs = 0, t0 = 0, running = false; clearInterval(prTimer);
