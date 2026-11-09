@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.3.0 (3단계: 자료 조사 엔진)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.0 (6단계: 연설·실연 연습)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -898,6 +898,363 @@ const Research = {
 };
 libLoad();
 
+
+/* =========================================================
+   5-4. 공개 강연 연설문 (연설문 도우미를 새 엔진 위에)
+   연설 = { id, topic, total, notes, sections:[{title, minutes, points}], speech, used, updatedAt }
+   소재목 i의 자료 조사 키: talk:<id>#<i>
+   ========================================================= */
+const CPM = 330;   // 분당 글자 수(공백 포함)
+const MARK_SRC = '[(\\[]\\s*(\\d{1,2})\\s*분\\s*[)\\]]';   // (3분) [3분]
+function normText(s){
+  return String(s).normalize('NFKC')
+    .replace(/[​-‍⁠﻿­]/g,'')
+    .replace(/[   -   　]/g,' ')
+    .replace(/[‐-―−]/g,'-');
+}
+// 출력물 머리말·꼬리말(저작권, 연사 유의 사항 안내문 등) 제거 + "30분에 다룰 것" 인식
+function cleanOutline(raw){
+  let s = normText(raw), total = null;
+  const tm = s.match(/(\d{1,2})\s*분에\s*다룰\s*것/); if(tm) total = +tm[1];
+  s = s.replace(/\[?\s*골자에\s*밀접히[\s\S]*$/,'').replace(/(?:\d{1,2}\s*분에\s*다룰\s*것)?\s*©[\s\S]*$/,'').replace(/\d{1,2}\s*분에\s*다룰\s*것\s*$/,'');
+  return {text:s, total};
+}
+function splitPoints(chunk){
+  const parts = chunk.split(/(?<=[)\]?])\s+(?![(「])|(?<=\.)\s+|\s+(?=\[(?!시각))/).map(s=>s.trim()).filter(Boolean);
+  const out = [];
+  for(const p of parts){
+    if(out.length && /^\[시각 자료/.test(p)) out[out.length-1] += ' '+p;   // [시각 자료 N] 은 앞 요점에 붙임
+    else out.push(p);
+  }
+  return out.join('\n');
+}
+function findMarks(text){
+  let marks = [...text.matchAll(new RegExp(MARK_SRC,'g'))];
+  if(marks.length<2){                                     // 괄호가 없는 "3분" 표기까지 허용 ("30분에" 같은 말은 제외)
+    const m2 = [...text.matchAll(/(?<![\d:])(\d{1,2})\s*분(?![가-힣])/g)];
+    if(m2.length>marks.length) marks = m2;
+  }
+  return marks;
+}
+function parseFlat(text0){
+  const text = text0.replace(/\s+/g,' ').trim();
+  const marks = findMarks(text);
+  if(marks.length<1) return null;
+  // 구간 끝에서 소재목 제목이 시작되는 위치: 직전 요점의 끝( ")" "]" 또는 문장 끝 ) 바로 뒤
+  const titleStart = seg => {
+    let best = Math.max(seg.lastIndexOf(')'), seg.lastIndexOf(']')) + 1;
+    for(const m of seg.matchAll(/(?:있다|한다|준다|된다|이다)\.?\s+|\.\s+/g)){
+      const e = m.index+m[0].length; if(e<seg.length && e>best) best = e;
+    }
+    return best;
+  };
+  let topic=null, notes=null;
+  const starts = []; let prevEnd = 0;
+  marks.forEach((m,i)=>{
+    const seg = text.slice(prevEnd, m.index).trimEnd();
+    let s = titleStart(seg);
+    if(i===0){
+      const k = seg.search(/유의\s*(?:점|사항)\s*[:：]/);
+      if(k>=0){
+        topic = seg.slice(0,k).trim().replace(/\s*연사의\s*$/,'').replace(/^주제\s*[:：]?\s*/,'');
+        const after = seg.slice(k).replace(/^유의\s*(?:점|사항)\s*[:：]\s*/,'');
+        const t = titleStart(after);
+        notes = after.slice(0,t).trim();
+        s = (seg.length - after.length) + t;
+      }
+    }
+    starts.push(prevEnd + s);
+    prevEnd = m.index + m[0].length;
+  });
+  const out = marks.map((m,i)=>{
+    const title = text.slice(starts[i], m.index).trim().replace(/[\s:：\-–—]+$/,'').replace(/^(?:\d+\s*[.)]\s*|[•·▪■□●○◆◇▶►※*\-–—]+\s*)/,'');
+    const endPts = i+1<marks.length ? starts[i+1] : text.length;
+    return {title, minutes:+m[1], points:splitPoints(text.slice(m.index+m[0].length, endPts).trim()), extra:'', results:null};
+  });
+  return {topic, notes, out};
+}
+function parseLines(text){
+  const BUL = /^[\s\-–—•·▪■□●○◆◇▶►※*]+/, NUM = /^\d+\s*[.)]\s+/;
+  const MINP = /[(\[][^)\]\n]*?(\d{1,2})\s*(?:분|min)[^)\]\n]*[)\]]/i;
+  const MINT = /(?:^|\s)(\d{1,2})\s*(?:분|min)\s*(?:간)?\s*$/i;
+  const minOf = s => { const m = s.match(MINP) || s.match(MINT); return m ? +m[1] : null; };
+  const strip = s => s.replace(MINP,'').replace(MINT,'').replace(/[\s:：\-–—]+$/,'').trim();
+  const clean = s => s.replace(BUL,'').replace(NUM,'').trim();
+  const mk = (title,minutes)=>({title, minutes:minutes||3, points:'', extra:'', results:null});
+  const lines = text.split(/\r?\n/).map(l=>l.trim());
+  let topic=null, notes=null; const body=[]; let inNotes=false, started=false;
+  const NOTE = /^(?:연사의\s*)?유의\s*(?:점|사항)\s*[:：]?\s*(.*)$/;
+  const firstIdx = lines.findIndex(l=>clean(l));
+  const early = lines.slice(firstIdx<0?0:firstIdx, (firstIdx<0?0:firstIdx)+8).map(clean).filter(Boolean).slice(0,5);
+  const hasNoteHead = early.slice(1).some(t=>NOTE.test(t));
+  for(let i=0;i<lines.length;i++){
+    const l = lines[i], t = clean(l);
+    if(!t){ body.push(''); inNotes=false; continue; }
+    if(minOf(t)!=null){ started = true; inNotes = false; body.push(l); continue; }   // 시간이 적힌 줄은 소재목 → 머리말 끝
+    if(!started && !topic && (/^(주제|제\s*\d+\s*번)/.test(t) || (i===firstIdx && hasNoteHead))){
+      topic = t.replace(/^주제\s*[:：]?\s*/,''); continue;                       // 맨 첫 줄(강연 제목)
+    }
+    if(!started){
+      const n = t.match(NOTE);
+      if(n){ notes = n[1]; inNotes = true; continue; }
+      if(inNotes){ notes = (notes?notes+' ':'') + t; continue; }
+    }
+    started = true; body.push(l);
+  }
+  const byMinutes = ()=>{
+    const out=[]; let cur=null;
+    for(const l of body){
+      const t = clean(l); if(!t) continue;
+      const m = minOf(t);
+      if(m!=null){
+        const title = strip(t);
+        if(!title){                       // "(3분)" 만 있는 줄 → 바로 앞 줄이 소재목
+          if(cur && cur.points){ const a=cur.points.split('\n'); const ttl=a.pop(); cur.points=a.join('\n'); cur = mk(ttl,m); out.push(cur); }
+          else if(cur && !cur.title){ cur.minutes=m; }
+          continue;
+        }
+        cur = mk(title,m); out.push(cur);
+      } else {
+        if(!cur){ cur = mk('',3); out.push(cur); }
+        cur.points += (cur.points?'\n':'')+t;
+      }
+    }
+    return out.filter(s=>s.title || s.points);
+  };
+  const byMarker = ()=>{
+    const out=[]; let cur=null;
+    const isHead = l => /^\s*[■□●○◆◇▶►]/.test(l) || /^\s*소재목\s*\d*/.test(l) || /^\s*[IVX]+\s*[.)]\s+/.test(l);
+    for(const l of body){
+      if(!clean(l)) continue;
+      const t = clean(l).replace(/^소재목\s*\d*\s*[:：.)]?\s*/,'');
+      if(isHead(l)){ cur = mk(strip(t), minOf(t)); out.push(cur); }
+      else { if(!cur){ cur=mk('',3); out.push(cur);} cur.points += (cur.points?'\n':'')+clean(l); }
+    }
+    return out;
+  };
+  const byBlank = ()=>{
+    const out=[]; let blk=[];
+    const flush=()=>{ if(blk.length){ const c=mk(strip(blk[0]),minOf(blk[0])); c.points=blk.slice(1).join('\n'); out.push(c); blk=[]; } };
+    for(const l of body){ const t=clean(l); if(!t) flush(); else blk.push(t); }
+    flush(); return out;
+  };
+  let out = byMinutes(), how='시간 표시(분)';
+  if(out.length<2){ const o=byMarker(); if(o.length>=2){ out=o; how='● ■ ▶ 등 기호'; } }
+  if(out.length<2){ const o=byBlank();  if(o.length>=2){ out=o; how='빈 줄'; } }
+  if(out.length===1 && !out[0].title && out[0].points.includes('\n')){
+    const [t,...rest]=out[0].points.split('\n'); out[0].title=t; out[0].points=rest.join('\n');
+  }
+  return {topic, notes, out, how};
+}
+
+const PODIUM_TPL = "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImtvIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9InV0Zi04Ij4KPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLCB2aWV3cG9ydC1maXQ9Y292ZXIiPgo8dGl0bGU+JSVUSVRMRSUlPC90aXRsZT4KPGxpbmsgcmVsPSJwcmVjb25uZWN0IiBocmVmPSJodHRwczovL2ZvbnRzLmdvb2dsZWFwaXMuY29tIj4KPGxpbmsgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbS9jc3MyP2ZhbWlseT1Ob3RvK1NhbnMrS1I6d2dodEA0MDA7NTAwOzcwMCZmYW1pbHk9Tm90bytTZXJpZitLUjp3Z2h0QDQwMDs2MDAmZGlzcGxheT1zd2FwIiByZWw9InN0eWxlc2hlZXQiPgo8c3R5bGU+Cjpyb290ewogIC0tYmc6IzE0MTMwZjsgLS1wYW5lbDojMWQxYzE3OyAtLWxpbmU6IzJmMmQyNjsgLS1pbms6I2VjZTZkODsgLS1tdXRlOiM5Yzk0ODM7CiAgLS1hY2NlbnQ6I2Q5YjM2YzsgLS1yZWFkLWJnOiMyYTI0MTg7IC0tcmVhZC1pbms6I2YxZDlhNjsKICAtLW9rOiM3ZmJmOGE7IC0td2FybjojZTRiMDRmOyAtLW92ZXI6I2U0NmE1YTsKICAtLWZzOjI0cHg7Cn0KaHRtbC5saWdodHsKICAtLWJnOiNmN2YzZWE7IC0tcGFuZWw6I2ZmZmZmZjsgLS1saW5lOiNlM2RjY2Q7IC0taW5rOiMyMTFlMTg7IC0tbXV0ZTojNmY2NzU4OwogIC0tYWNjZW50OiM4YTY0MjA7IC0tcmVhZC1iZzojZjVlYWQyOyAtLXJlYWQtaW5rOiM1YjQyMTA7CiAgLS1vazojMmY3ZDQzOyAtLXdhcm46I2E4NmQwMDsgLS1vdmVyOiNiNzM2MmE7Cn0KKntib3gtc2l6aW5nOmJvcmRlci1ib3h9CmJvZHl7bWFyZ2luOjA7YmFja2dyb3VuZDp2YXIoLS1iZyk7Y29sb3I6dmFyKC0taW5rKTtmb250LWZhbWlseToiTm90byBTYW5zIEtSIixzeXN0ZW0tdWksc2Fucy1zZXJpZjsKICBwYWRkaW5nLWxlZnQ6ZW52KHNhZmUtYXJlYS1pbnNldC1sZWZ0KTtwYWRkaW5nLXJpZ2h0OmVudihzYWZlLWFyZWEtaW5zZXQtcmlnaHQpOy13ZWJraXQtdGV4dC1zaXplLWFkanVzdDoxMDAlfQouYmFye3Bvc2l0aW9uOnN0aWNreTt0b3A6MDt6LWluZGV4OjEwO2JhY2tncm91bmQ6dmFyKC0tcGFuZWwpO2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpOwogIHBhZGRpbmc6Y2FsYygxMHB4ICsgZW52KHNhZmUtYXJlYS1pbnNldC10b3ApKSAxNnB4IDEwcHg7fQoucm93e2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjE0cHg7ZmxleC13cmFwOndyYXA7bWF4LXdpZHRoOjk4MHB4O21hcmdpbjowIGF1dG99Ci5jbG9ja3tmb250LXZhcmlhbnQtbnVtZXJpYzp0YWJ1bGFyLW51bXM7Zm9udC13ZWlnaHQ6NzAwO2ZvbnQtc2l6ZTo0MHB4O2xldHRlci1zcGFjaW5nOi41cHg7bGluZS1oZWlnaHQ6MTtjb2xvcjp2YXIoLS1vayk7bWluLXdpZHRoOjUuMmNofQouY2xvY2sgc21hbGx7Zm9udC1zaXplOjE2cHg7Y29sb3I6dmFyKC0tbXV0ZSk7Zm9udC13ZWlnaHQ6NTAwO21hcmdpbi1sZWZ0OjRweH0KLmNsb2NrLndhcm57Y29sb3I6dmFyKC0td2Fybil9IC5jbG9jay5vdmVye2NvbG9yOnZhcigtLW92ZXIpfQoubm93e2ZsZXg6MTttaW4td2lkdGg6MjAwcHh9Ci5ub3cgLmxibHtmb250LXNpemU6MTNweDtjb2xvcjp2YXIoLS1tdXRlKX0KLm5vdyAubm17Zm9udC1zaXplOjE3cHg7Zm9udC13ZWlnaHQ6NzAwO3doaXRlLXNwYWNlOm5vd3JhcDtvdmVyZmxvdzpoaWRkZW47dGV4dC1vdmVyZmxvdzplbGxpcHNpc30KLm5vdyAuc3Vie2ZvbnQtc2l6ZToxNHB4O2ZvbnQtdmFyaWFudC1udW1lcmljOnRhYnVsYXItbnVtcztjb2xvcjp2YXIoLS1tdXRlKX0KLm5vdyAuc3ViIGJ7Y29sb3I6dmFyKC0taW5rKX0gLm5vdyAuc3ViIC5sYXRle2NvbG9yOnZhcigtLW92ZXIpfSAubm93IC5zdWIgLmVhcmx5e2NvbG9yOnZhcigtLW9rKX0KLmJ0bnN7ZGlzcGxheTpmbGV4O2dhcDo2cHg7ZmxleC13cmFwOndyYXB9CmJ1dHRvbntmb250OmluaGVyaXQ7Zm9udC1zaXplOjE1cHg7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTtiYWNrZ3JvdW5kOnRyYW5zcGFyZW50O2NvbG9yOnZhcigtLWluayk7CiAgYm9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6OXB4IDEycHg7Y3Vyc29yOnBvaW50ZXI7bWluLWhlaWdodDo0MnB4fQpidXR0b246YWN0aXZle3RyYW5zZm9ybTp0cmFuc2xhdGVZKDFweCl9CmJ1dHRvbi5wcml7YmFja2dyb3VuZDp2YXIoLS1hY2NlbnQpO2JvcmRlci1jb2xvcjp2YXIoLS1hY2NlbnQpO2NvbG9yOnZhcigtLWJnKTtmb250LXdlaWdodDo3MDA7bWluLXdpZHRoOjg0cHh9CmJ1dHRvbi5hcm17Ym9yZGVyLWNvbG9yOnZhcigtLW92ZXIpO2NvbG9yOnZhcigtLW92ZXIpfQoucHJvZ3twb3NpdGlvbjpyZWxhdGl2ZTtoZWlnaHQ6OHB4O21hcmdpbjoxMHB4IGF1dG8gMDttYXgtd2lkdGg6OTgwcHg7ZGlzcGxheTpmbGV4O2dhcDozcHh9Ci5wcm9nIC5zZWd7aGVpZ2h0OjEwMCU7YmFja2dyb3VuZDp2YXIoLS1saW5lKTtib3JkZXItcmFkaXVzOjRweDtwb3NpdGlvbjpyZWxhdGl2ZTtvdmVyZmxvdzpoaWRkZW47Y3Vyc29yOnBvaW50ZXJ9Ci5wcm9nIC5zZWcgaXtwb3NpdGlvbjphYnNvbHV0ZTtpbnNldDowO3dpZHRoOjA7YmFja2dyb3VuZDp2YXIoLS1hY2NlbnQpO29wYWNpdHk6Ljg1fQoucHJvZyAuc2VnLm92ZXIgaXtiYWNrZ3JvdW5kOnZhcigtLW92ZXIpfQoudG9vbHN7ZGlzcGxheTpub25lO21hcmdpbi10b3A6OHB4fQouYmFyLm9wZW4gLnRvb2xze2Rpc3BsYXk6ZmxleH0KbWFpbnttYXgtd2lkdGg6OTgwcHg7bWFyZ2luOjAgYXV0bztwYWRkaW5nOjIycHggMThweCA0MHZofQpoMXtmb250LWZhbWlseToiTm90byBTZXJpZiBLUiIsc2VyaWY7Zm9udC13ZWlnaHQ6NjAwO2ZvbnQtc2l6ZTpjYWxjKHZhcigtLWZzKSoxLjA1KTttYXJnaW46NnB4IDAgMjJweDtjb2xvcjp2YXIoLS1tdXRlKX0KLnNlY3ttYXJnaW46MCAwIDM2cHg7Ym9yZGVyLWxlZnQ6M3B4IHNvbGlkIHRyYW5zcGFyZW50O3BhZGRpbmctbGVmdDoxNHB4O3RyYW5zaXRpb246Ym9yZGVyLWNvbG9yIC4ycyxvcGFjaXR5IC4yc30KLnNlYy5jdXJ7Ym9yZGVyLWxlZnQtY29sb3I6dmFyKC0tYWNjZW50KX0KLnNlYy5kb25le29wYWNpdHk6LjU1fQouc2h7ZGlzcGxheTpmbGV4O2dhcDoxMnB4O2FsaWduLWl0ZW1zOmZsZXgtc3RhcnQ7Y3Vyc29yOnBvaW50ZXI7bWFyZ2luLWJvdHRvbToxMHB4O3Njcm9sbC1tYXJnaW4tdG9wOjE1MHB4fQouc257ZmxleDpub25lO3dpZHRoOjM0cHg7aGVpZ2h0OjM0cHg7Ym9yZGVyLXJhZGl1czo1MCU7YmFja2dyb3VuZDp2YXIoLS1hY2NlbnQpO2NvbG9yOnZhcigtLWJnKTtkaXNwbGF5OmdyaWQ7cGxhY2UtaXRlbXM6Y2VudGVyO2ZvbnQtd2VpZ2h0OjcwMH0KLnNoIGgye21hcmdpbjowO2ZvbnQtc2l6ZTpjYWxjKHZhcigtLWZzKSouOTUpO2xpbmUtaGVpZ2h0OjEuMzV9Ci5tZXRhe2ZvbnQtc2l6ZToxNHB4O2NvbG9yOnZhcigtLW11dGUpO21hcmdpbi10b3A6NHB4O2ZvbnQtdmFyaWFudC1udW1lcmljOnRhYnVsYXItbnVtc30KLm1ldGEgLmFjdHVhbHttYXJnaW4tbGVmdDo4cHg7Zm9udC13ZWlnaHQ6NzAwfQoubWV0YSAuYWN0dWFsLmxhdGV7Y29sb3I6dmFyKC0tb3Zlcil9IC5tZXRhIC5hY3R1YWwub2t7Y29sb3I6dmFyKC0tb2spfQouYm9keSBwe2ZvbnQtZmFtaWx5OiJOb3RvIFNlcmlmIEtSIixzZXJpZjtmb250LXNpemU6dmFyKC0tZnMpO2xpbmUtaGVpZ2h0OjEuODU7bWFyZ2luOjAgMCAuOWVtO3dvcmQtYnJlYWs6a2VlcC1hbGx9Ci5yZWFke2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjEycHg7YmFja2dyb3VuZDp2YXIoLS1yZWFkLWJnKTtjb2xvcjp2YXIoLS1yZWFkLWluayk7CiAgYm9yZGVyLXJhZGl1czoxMnB4O3BhZGRpbmc6MTJweCAxNnB4O21hcmdpbjo0cHggMCAxNHB4O2ZvbnQtc2l6ZTpjYWxjKHZhcigtLWZzKSouOTUpO2ZvbnQtd2VpZ2h0OjcwMH0KLnJlYWQgLnRhZ3tmb250LXNpemU6MTNweDtmb250LXdlaWdodDo1MDA7Ym9yZGVyOjFweCBzb2xpZCBjdXJyZW50Q29sb3I7Ym9yZGVyLXJhZGl1czo5OTlweDtwYWRkaW5nOjJweCA5cHg7b3BhY2l0eTouODU7d2hpdGUtc3BhY2U6bm93cmFwfQpkZXRhaWxzLnJlZnN7bWFyZ2luLXRvcDo1MHB4O2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmctdG9wOjE2cHg7Y29sb3I6dmFyKC0tbXV0ZSk7Zm9udC1zaXplOjE1cHg7bGluZS1oZWlnaHQ6MS43fQpkZXRhaWxzLnJlZnMgc3VtbWFyeXtjdXJzb3I6cG9pbnRlcjtmb250LXdlaWdodDo3MDA7Y29sb3I6dmFyKC0taW5rKX0KZGV0YWlscy5yZWZzIGg0e21hcmdpbjoxNnB4IDAgNHB4O2NvbG9yOnZhcigtLWluayl9Ci5lZGl0YmFye2Rpc3BsYXk6bm9uZTttYXgtd2lkdGg6OTgwcHg7bWFyZ2luOjhweCBhdXRvIDA7Z2FwOjZweDtmbGV4LXdyYXA6d3JhcDthbGlnbi1pdGVtczpjZW50ZXI7Zm9udC1zaXplOjE0cHg7Y29sb3I6dmFyKC0td2Fybil9CmJvZHkuZWRpdGluZyAuZWRpdGJhcntkaXNwbGF5OmZsZXh9CmJvZHkuZWRpdGluZyAuZWRpdGJhciBzcGFue2ZsZXg6MTttaW4td2lkdGg6MTgwcHh9CmJvZHkuZWRpdGluZyAuYm9keSBwe291dGxpbmU6MXB4IGRhc2hlZCB2YXIoLS1saW5lKTtvdXRsaW5lLW9mZnNldDo0cHg7Ym9yZGVyLXJhZGl1czo0cHg7Y3Vyc29yOnRleHR9CmJvZHkuZWRpdGluZyAuYm9keSBwOmZvY3Vze291dGxpbmU6MnB4IHNvbGlkIHZhcigtLWFjY2VudCl9Ci5ib2R5IHAuZWRpdGVke2JveC1zaGFkb3c6LTZweCAwIDAgLTNweCB2YXIoLS13YXJuKX0KI2NvcHlib3h7ZGlzcGxheTpub25lO3Bvc2l0aW9uOmZpeGVkO2luc2V0OjEwJSA2JTt6LWluZGV4OjMwO2JhY2tncm91bmQ6dmFyKC0tcGFuZWwpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxNHB4O3BhZGRpbmc6MTRweDtmbGV4LWRpcmVjdGlvbjpjb2x1bW47Z2FwOjEwcHh9CiNjb3B5Ym94LnNob3d7ZGlzcGxheTpmbGV4fQojY29weWJveCB0ZXh0YXJlYXtmbGV4OjE7d2lkdGg6MTAwJTtiYWNrZ3JvdW5kOnZhcigtLWJnKTtjb2xvcjp2YXIoLS1pbmspO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzoxMHB4O2ZvbnQ6MTRweC8xLjYgIk5vdG8gU2FucyBLUiIsc2Fucy1zZXJpZn0KLmhpbnR7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZSk7bWF4LXdpZHRoOjk4MHB4O21hcmdpbjo2cHggYXV0byAwfQpAbWVkaWEgKG1heC13aWR0aDo2NDBweCl7CiAgLmNsb2Nre2ZvbnQtc2l6ZTozMnB4fSAuYmFye3BhZGRpbmctbGVmdDoxMnB4O3BhZGRpbmctcmlnaHQ6MTJweH0KICAuYnRucyBidXR0b24ub3B0e2Rpc3BsYXk6bm9uZX0KICBtYWlue3BhZGRpbmctbGVmdDoxMnB4O3BhZGRpbmctcmlnaHQ6MTJweH0KfQo8L3N0eWxlPgo8L2hlYWQ+Cjxib2R5Pgo8ZGl2IGNsYXNzPSJiYXIiIGlkPSJiYXIiPgogIDxkaXYgY2xhc3M9InJvdyI+CiAgICA8ZGl2IGNsYXNzPSJjbG9jayIgaWQ9ImNsb2NrIj4wOjAwPHNtYWxsPi8gJSVUT1RBTCUlOjAwPC9zbWFsbD48L2Rpdj4KICAgIDxkaXYgY2xhc3M9Im5vdyI+CiAgICAgIDxkaXYgY2xhc3M9ImxibCIgaWQ9ImxibCI+64yA6riwIOykkSDCtyDilrYg7Iuc7J6R7J2EIOuIhOultOyEuOyalDwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJubSIgaWQ9Im5tIj48L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0ic3ViIiBpZD0ic3ViIj48L2Rpdj4KICAgIDwvZGl2PgogICAgPGRpdiBjbGFzcz0iYnRucyI+CiAgICAgIDxidXR0b24gY2xhc3M9InByaSIgaWQ9InBsYXkiPuKWtiDsi5zsnpE8L2J1dHRvbj4KICAgICAgPGJ1dHRvbiBpZD0ibmV4dCI+64uk7J2MIOKAujwvYnV0dG9uPgogICAgICA8YnV0dG9uIGlkPSJtb3JlIiBhcmlhLWxhYmVsPSLshKTsoJUiPuKLrzwvYnV0dG9uPgogICAgPC9kaXY+CiAgPC9kaXY+CiAgPGRpdiBjbGFzcz0icm93IHRvb2xzIj4KICAgIDxidXR0b24gaWQ9ImZzbSI+6rCA4oiSPC9idXR0b24+PGJ1dHRvbiBpZD0iZnNwIj7qsIArPC9idXR0b24+CiAgICA8YnV0dG9uIGlkPSJ0aGVtZSI+67Cd6rKML+yWtOuRoeqyjDwvYnV0dG9uPgogICAgPGJ1dHRvbiBpZD0iZnVsbCI+7KCE7LK0IO2ZlOuptDwvYnV0dG9uPgogICAgPGJ1dHRvbiBpZD0iZWRpdCI+4pyOIO2OuOynkTwvYnV0dG9uPgogICAgPGJ1dHRvbiBpZD0icmVzZXQiPuKGuiDstIjquLDtmZQ8L2J1dHRvbj4KICA8L2Rpdj4KICA8ZGl2IGNsYXNzPSJlZGl0YmFyIj48c3Bhbj7tjrjsp5Eg7KSRIMK3IOusuOuLqOydhCDriIzrn6wg6rOg7LmY7IS47JqULiDqs6DsuZwg64K07Jqp7J2AIOydtCDquLDquLDsl5Ag7J6Q64+ZIOyggOyepeuQqeuLiOuLpC48L3NwYW4+CiAgICA8YnV0dG9uIGlkPSJjb3B5Ij7sm5Dqs6Ag67O17IKsPC9idXR0b24+PGJ1dHRvbiBpZD0icmV2ZXJ0Ij7sm5DrnpjrjIDroZw8L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJwcmkiIGlkPSJkb25lIj7smYTro4w8L2J1dHRvbj48L2Rpdj4KICA8ZGl2IGNsYXNzPSJwcm9nIiBpZD0icHJvZyI+PC9kaXY+CjwvZGl2Pgo8bWFpbj4KPGgxPiUlVElUTEUlJTwvaDE+CiUlU0VDVElPTlMlJQo8ZGV0YWlscyBjbGFzcz0icmVmcyI+PHN1bW1hcnk+7IKs7Jqp7ZWcIOyekOujjCAo7Jew7IKsIOywuOqzoOyaqSk8L3N1bW1hcnk+JSVSRUZTJSU8L2RldGFpbHM+CjxkaXYgaWQ9ImNvcHlib3giPjxkaXY+7J6Q64+ZIOuzteyCrOqwgCDrp4ntmIAg7J6I7Ja0IOyVhOuemCDsm5Dqs6Drpbwg7KeB7KCRIOuzteyCrO2VtCDso7zshLjsmpQgKOyghOyytCDshKDtg50g7ZuEIOuzteyCrCkuPC9kaXY+PHRleHRhcmVhIGlkPSJjb3B5dGEiIHJlYWRvbmx5PjwvdGV4dGFyZWE+PGJ1dHRvbiBpZD0iY29weWNsb3NlIj7ri6vquLA8L2J1dHRvbj48L2Rpdj4KPHAgY2xhc3M9ImhpbnQiPuuLqOy2le2CpDog7Iqk7Y6Y7J207IqkID0g7Iuc7J6RL+ydvOyLnOygleyngCwg4oaSID0g64uk7J2MIOyGjOyerOuqqS4g7IaM7J6s66qpIOygnOuqqeydhCDriITrpbTrqbQg6re4IOyGjOyerOuqqeu2gO2EsCDsi5zqsITsnYQg7J6964uI64ukLiDtjrjsp5HsnYAg4ouvIOuplOuJtOydmCDinI4g7Y647KeR7JeQ7IScIO2VoCDsiJgg7J6I7Iq164uI64ukLjwvcD4KPC9tYWluPgo8c2NyaXB0Pgpjb25zdCBNRVRBPSUlTUVUQSUlLCBUT1RBTD0lJVRPVEFMJSUqNjA7CmNvbnN0ICQ9aWQ9PmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKGlkKTsKbGV0IHJ1bm5pbmc9ZmFsc2UsIGFjYz0wLCB0MD0wLCBjdXI9LTEsIG1hcmtzPVtdLCB0aWNrPW51bGwsIHdha2U9bnVsbDsKY29uc3Qgc3RvcmU9e2dldChrKXt0cnl7cmV0dXJuIGxvY2FsU3RvcmFnZS5nZXRJdGVtKGspfWNhdGNoKGUpe3JldHVybiBudWxsfX0sc2V0KGssdil7dHJ5e2xvY2FsU3RvcmFnZS5zZXRJdGVtKGssdil9Y2F0Y2goZSl7fX19Owpjb25zdCBmbXQ9cz0+e3M9TWF0aC5tYXgoMCxNYXRoLmZsb29yKHMpKTtyZXR1cm4gTWF0aC5mbG9vcihzLzYwKSsnOicrU3RyaW5nKHMlNjApLnBhZFN0YXJ0KDIsJzAnKX07CmNvbnN0IHNmbXQ9cz0+KHM8MD8n4oiSJzonKycpK2ZtdChNYXRoLmFicyhzKSk7CmNvbnN0IGVsYXBzZWQ9KCk9PmFjYysocnVubmluZz8ocGVyZm9ybWFuY2Uubm93KCktdDApLzEwMDA6MCk7CgovLyBwcm9ncmVzcyBzZWdtZW50cwpNRVRBLmZvckVhY2goKG0saSk9Pntjb25zdCBkPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpO2QuY2xhc3NOYW1lPSdzZWcnO2Quc3R5bGUuZmxleD1tLm1pbnM7ZC5pbm5lckhUTUw9JzxpPjwvaT4nO2Qub25jbGljaz0oKT0+Z28oaSk7JCgncHJvZycpLmFwcGVuZENoaWxkKGQpfSk7CgpmdW5jdGlvbiBzZXRDdXIoaSl7CiAgY29uc3QgZT1lbGFwc2VkKCk7CiAgaWYoY3VyPj0wKSBtYXJrc1tjdXJdLmVuZD1lOwogIGN1cj1pOyBtYXJrc1tpXT17c3RhcnQ6ZSxlbmQ6bnVsbH07CiAgZm9yKGxldCBrPWkrMTtrPE1FVEEubGVuZ3RoO2srKykgbWFya3Nba109dW5kZWZpbmVkOwogIGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJy5zZWMnKS5mb3JFYWNoKChzLGspPT57cy5jbGFzc0xpc3QudG9nZ2xlKCdjdXInLGs9PT1pKTtzLmNsYXNzTGlzdC50b2dnbGUoJ2RvbmUnLGs8aSl9KTsKICAkKCdzJytpKS5xdWVyeVNlbGVjdG9yKCcuc2gnKS5zY3JvbGxJbnRvVmlldyh7YmVoYXZpb3I6J3Ntb290aCcsYmxvY2s6J3N0YXJ0J30pOwogIHJlbmRlcigpOwp9CmZ1bmN0aW9uIGdvKGkpeyBpZighcnVubmluZyAmJiBhY2M9PT0wKSBzdGFydCgpOyBzZXRDdXIoaSk7IH0KYXN5bmMgZnVuY3Rpb24gbG9ja1NjcmVlbigpe3RyeXtpZignd2FrZUxvY2snIGluIG5hdmlnYXRvcikgd2FrZT1hd2FpdCBuYXZpZ2F0b3Iud2FrZUxvY2sucmVxdWVzdCgnc2NyZWVuJyl9Y2F0Y2goZSl7fX0KZnVuY3Rpb24gc3RhcnQoKXtydW5uaW5nPXRydWU7dDA9cGVyZm9ybWFuY2Uubm93KCk7JCgncGxheScpLnRleHRDb250ZW50PSfinZrinZog7J287Iuc7KCV7KeAJztpZihjdXI8MCkgc2V0Q3VyKDApO3RpY2s9c2V0SW50ZXJ2YWwocmVuZGVyLDI1MCk7bG9ja1NjcmVlbigpO3JlbmRlcigpfQpmdW5jdGlvbiBwYXVzZSgpe2FjYz1lbGFwc2VkKCk7cnVubmluZz1mYWxzZTskKCdwbGF5JykudGV4dENvbnRlbnQ9J+KWtiDqs4Tsho0nO2NsZWFySW50ZXJ2YWwodGljayk7cmVuZGVyKCl9CiQoJ3BsYXknKS5vbmNsaWNrPSgpPT5ydW5uaW5nP3BhdXNlKCk6c3RhcnQoKTsKJCgnbmV4dCcpLm9uY2xpY2s9KCk9PnsgaWYoY3VyPDApe3N0YXJ0KCk7cmV0dXJufSBpZihjdXI8TUVUQS5sZW5ndGgtMSkgc2V0Q3VyKGN1cisxKSB9OwpsZXQgYXJtZWQ9bnVsbDsKJCgncmVzZXQnKS5vbmNsaWNrPSgpPT57CiAgY29uc3QgYj0kKCdyZXNldCcpOwogIGlmKCFhcm1lZCl7Yi5jbGFzc0xpc3QuYWRkKCdhcm0nKTtiLnRleHRDb250ZW50PSftlZwg67KIIOuNlCDriITrpbTrqbQg7LSI6riw7ZmUJzthcm1lZD1zZXRUaW1lb3V0KCgpPT57YXJtZWQ9bnVsbDtiLmNsYXNzTGlzdC5yZW1vdmUoJ2FybScpO2IudGV4dENvbnRlbnQ9J+KGuiDstIjquLDtmZQnfSwyNTAwKTtyZXR1cm59CiAgY2xlYXJUaW1lb3V0KGFybWVkKTthcm1lZD1udWxsO2IuY2xhc3NMaXN0LnJlbW92ZSgnYXJtJyk7Yi50ZXh0Q29udGVudD0n4oa6IOy0iOq4sO2ZlCc7CiAgY2xlYXJJbnRlcnZhbCh0aWNrKTtydW5uaW5nPWZhbHNlO2FjYz0wO2N1cj0tMTttYXJrcz1bXTskKCdwbGF5JykudGV4dENvbnRlbnQ9J+KWtiDsi5zsnpEnOwogIGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJy5zZWMnKS5mb3JFYWNoKHM9PnMuY2xhc3NMaXN0LnJlbW92ZSgnY3VyJywnZG9uZScpKTsKICBNRVRBLmZvckVhY2goKG0saSk9PnskKCdhJytpKS50ZXh0Q29udGVudD0nJzskKCdhJytpKS5jbGFzc05hbWU9J2FjdHVhbCd9KTsKICB3aW5kb3cuc2Nyb2xsVG8oe3RvcDowLGJlaGF2aW9yOidzbW9vdGgnfSk7cmVuZGVyKCk7Cn07CmRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJy5zaCcpLmZvckVhY2goaD0+aC5vbmNsaWNrPSgpPT5nbygraC5kYXRhc2V0LmkpKTsKJCgnbW9yZScpLm9uY2xpY2s9KCk9PiQoJ2JhcicpLmNsYXNzTGlzdC50b2dnbGUoJ29wZW4nKTsKCmZ1bmN0aW9uIHJlbmRlcigpewogIGNvbnN0IGU9ZWxhcHNlZCgpOwogIGNvbnN0IGM9JCgnY2xvY2snKTsgYy5maXJzdENoaWxkLm5vZGVWYWx1ZT1mbXQoZSk7CiAgYy5jbGFzc05hbWU9J2Nsb2NrJysoZT5UT1RBTD8nIG92ZXInOmU+VE9UQUwtMTIwPycgd2Fybic6JycpOwogIGNvbnN0IHNlZ3M9JCgncHJvZycpLmNoaWxkcmVuOwogIE1FVEEuZm9yRWFjaCgobSxpKT0+ewogICAgY29uc3QgbWs9bWFya3NbaV07IGxldCB1c2VkPTA7CiAgICBpZihtaykgdXNlZD0obWsuZW5kPz9lKS1tay5zdGFydDsKICAgIHNlZ3NbaV0uZmlyc3RDaGlsZC5zdHlsZS53aWR0aD1NYXRoLm1pbigxMDAsdXNlZC8obS5taW5zKjYwKSoxMDApKyclJzsKICAgIHNlZ3NbaV0uY2xhc3NMaXN0LnRvZ2dsZSgnb3ZlcicsdXNlZD5tLm1pbnMqNjApOwogICAgY29uc3QgYT0kKCdhJytpKTsKICAgIGlmKG1rJiZtay5lbmQhPW51bGwpe2NvbnN0IGQ9dXNlZC1tLm1pbnMqNjA7YS50ZXh0Q29udGVudD0n7Iuk7KCcICcrZm10KHVzZWQpKycgKCcrc2ZtdChkKSsnKSc7YS5jbGFzc05hbWU9J2FjdHVhbCAnKyhkPjE1PydsYXRlJzonb2snKX0KICB9KTsKICBpZihjdXI8MCl7JCgnbGJsJykudGV4dENvbnRlbnQ9J+uMgOq4sCDspJEgwrcg4pa2IOyLnOyekeydhCDriITrpbTshLjsmpQnOyQoJ25tJykudGV4dENvbnRlbnQ9Jyc7JCgnc3ViJykudGV4dENvbnRlbnQ9Jyc7cmV0dXJufQogIGNvbnN0IG09TUVUQVtjdXJdLCBtaz1tYXJrc1tjdXJdLCB1c2VkPWUtbWsuc3RhcnQsIGxlZnQ9bS5taW5zKjYwLXVzZWQ7CiAgJCgnbGJsJykudGV4dENvbnRlbnQ9J+yGjOyerOuqqSAnKyhjdXIrMSkrJyAvICcrTUVUQS5sZW5ndGgrKHJ1bm5pbmc/Jyc6JyDCtyDsnbzsi5zsoJXsp4AnKTsKICAkKCdubScpLnRleHRDb250ZW50PW0ubmFtZTsKICBjb25zdCBkcmlmdD1tay5zdGFydC1tLnN0YXJ0KjYwOwogIGNvbnN0IGRyaWZ0VHh0PU1hdGguYWJzKGRyaWZ0KTwxMD8n6rOE7ZqN64yA66GcIOyLnOyekSc6KGRyaWZ0PjA/JzxzcGFuIGNsYXNzPSJsYXRlIj7qs4Ttmo3rs7Tri6QgJytmbXQoZHJpZnQpKycg64qm6rKMIOyLnOyekTwvc3Bhbj4nOic8c3BhbiBjbGFzcz0iZWFybHkiPuqzhO2ajeuztOuLpCAnK2ZtdCgtZHJpZnQpKycg7J287LCNIOyLnOyekTwvc3Bhbj4nKTsKICAkKCdzdWInKS5pbm5lckhUTUw9J+qyveqzvCA8Yj4nK2ZtdCh1c2VkKSsnPC9iPiAvICcrbS5taW5zKyc6MDAgwrcgJysobGVmdD49MD8n64Ko7J2AIOyLnOqwhCA8Yj4nK2ZtdChsZWZ0KSsnPC9iPic6JzxzcGFuIGNsYXNzPSJsYXRlIj4nK2ZtdCgtbGVmdCkrJyDstIjqs7w8L3NwYW4+JykrJyDCtyAnK2RyaWZ0VHh0Owp9CmRvY3VtZW50LmFkZEV2ZW50TGlzdGVuZXIoJ2tleWRvd24nLGV2PT57CiAgaWYoZG9jdW1lbnQuYm9keS5jbGFzc0xpc3QuY29udGFpbnMoJ2VkaXRpbmcnKXx8ZXYudGFyZ2V0LmlzQ29udGVudEVkaXRhYmxlfHwvVEVYVEFSRUF8SU5QVVQvLnRlc3QoZXYudGFyZ2V0LnRhZ05hbWUpKSByZXR1cm47CiAgaWYoZXYuY29kZT09PSdTcGFjZScpe2V2LnByZXZlbnREZWZhdWx0KCk7JCgncGxheScpLmNsaWNrKCl9CiAgZWxzZSBpZihldi5jb2RlPT09J0Fycm93UmlnaHQnKXtldi5wcmV2ZW50RGVmYXVsdCgpOyQoJ25leHQnKS5jbGljaygpfQp9KTsKZG9jdW1lbnQuYWRkRXZlbnRMaXN0ZW5lcigndmlzaWJpbGl0eWNoYW5nZScsKCk9PntpZihkb2N1bWVudC52aXNpYmlsaXR5U3RhdGU9PT0ndmlzaWJsZScmJnJ1bm5pbmcpIGxvY2tTY3JlZW4oKX0pOwoKLy8gZm9udCBzaXplICYgdGhlbWUKbGV0IGZzPXBhcnNlSW50KHN0b3JlLmdldCgndGFsay1mcycpKXx8MjQ7CmNvbnN0IGFwcGx5RnM9KCk9Pntkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuc3R5bGUuc2V0UHJvcGVydHkoJy0tZnMnLGZzKydweCcpO3N0b3JlLnNldCgndGFsay1mcycsZnMpfTsKJCgnZnNtJykub25jbGljaz0oKT0+e2ZzPU1hdGgubWF4KDE2LGZzLTIpO2FwcGx5RnMoKX07CiQoJ2ZzcCcpLm9uY2xpY2s9KCk9Pntmcz1NYXRoLm1pbig0NCxmcysyKTthcHBseUZzKCl9OwppZihzdG9yZS5nZXQoJ3RhbGstdGhlbWUnKT09PSdsaWdodCcpIGRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5jbGFzc0xpc3QuYWRkKCdsaWdodCcpOwokKCd0aGVtZScpLm9uY2xpY2s9KCk9Pntjb25zdCBsPWRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5jbGFzc0xpc3QudG9nZ2xlKCdsaWdodCcpO3N0b3JlLnNldCgndGFsay10aGVtZScsbD8nbGlnaHQnOidkYXJrJyl9OwokKCdmdWxsJykub25jbGljaz1hc3luYygpPT57dHJ5e2lmKCFkb2N1bWVudC5mdWxsc2NyZWVuRWxlbWVudCkgYXdhaXQgZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50LnJlcXVlc3RGdWxsc2NyZWVuKCk7IGVsc2UgYXdhaXQgZG9jdW1lbnQuZXhpdEZ1bGxzY3JlZW4oKX1jYXRjaChlKXt9fTsKCi8vIC0tLS0gZWRpdCBtb2RlIC0tLS0KY29uc3QgRUtFWT0ndGFsay1lZGl0cy0nK2RvY3VtZW50LnRpdGxlOwpsZXQgZWRpdHM9e307IHRyeXtlZGl0cz1KU09OLnBhcnNlKHN0b3JlLmdldChFS0VZKXx8J3t9Jyl8fHt9fWNhdGNoKGUpe2VkaXRzPXt9fQpjb25zdCBwYXJhcz1bXTsKZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnLnNlYycpLmZvckVhY2goKHNlYyxpKT0+e3NlYy5xdWVyeVNlbGVjdG9yQWxsKCcuYm9keSBwJykuZm9yRWFjaCgocCxqKT0+ewogIGNvbnN0IGs9aSsnLScrajsgcC5kYXRhc2V0Lms9azsgcC5kYXRhc2V0Lm9yaWc9cC5pbm5lclRleHQ7IHBhcmFzLnB1c2gocCk7CiAgY29uc3QgZT1lZGl0c1trXTsKICBpZihlJiZlLm9yaWc9PT1wLmRhdGFzZXQub3JpZyYmZS50ZXh0IT09ZS5vcmlnKXtwLnRleHRDb250ZW50PWUudGV4dDtwLmNsYXNzTGlzdC5hZGQoJ2VkaXRlZCcpfQp9KX0pOwpsZXQgc2F2ZVQ9bnVsbDsKZnVuY3Rpb24gc2F2ZUFsbCgpewogIGNvbnN0IG89e307CiAgcGFyYXMuZm9yRWFjaChwPT57Y29uc3QgdHg9cC5pbm5lclRleHQucmVwbGFjZSgvXHMqXG5ccyovZywnICcpLnRyaW0oKTtpZih0eCE9PXAuZGF0YXNldC5vcmlnKXtvW3AuZGF0YXNldC5rXT17b3JpZzpwLmRhdGFzZXQub3JpZyx0ZXh0OnR4fTtwLmNsYXNzTGlzdC5hZGQoJ2VkaXRlZCcpfWVsc2UgcC5jbGFzc0xpc3QucmVtb3ZlKCdlZGl0ZWQnKX0pOwogIGVkaXRzPW87IHN0b3JlLnNldChFS0VZLEpTT04uc3RyaW5naWZ5KG8pKTsKfQpwYXJhcy5mb3JFYWNoKHA9PnsKICBwLmFkZEV2ZW50TGlzdGVuZXIoJ2lucHV0JywoKT0+e2NsZWFyVGltZW91dChzYXZlVCk7c2F2ZVQ9c2V0VGltZW91dChzYXZlQWxsLDQwMCl9KTsKICBwLmFkZEV2ZW50TGlzdGVuZXIoJ2tleWRvd24nLGV2PT57aWYoZXYua2V5PT09J0VudGVyJyl7ZXYucHJldmVudERlZmF1bHQoKTtwLmJsdXIoKX19KTsKICBwLmFkZEV2ZW50TGlzdGVuZXIoJ3Bhc3RlJyxldj0+e2V2LnByZXZlbnREZWZhdWx0KCk7Y29uc3QgdHg9KGV2LmNsaXBib2FyZERhdGF8fHdpbmRvdy5jbGlwYm9hcmREYXRhKS5nZXREYXRhKCd0ZXh0L3BsYWluJykucmVwbGFjZSgvXHMqXG5ccyovZywnICcpO2RvY3VtZW50LmV4ZWNDb21tYW5kKCdpbnNlcnRUZXh0JyxmYWxzZSx0eCl9KTsKfSk7CmZ1bmN0aW9uIHNldEVkaXRpbmcob24pewogIGRvY3VtZW50LmJvZHkuY2xhc3NMaXN0LnRvZ2dsZSgnZWRpdGluZycsb24pOwogIHBhcmFzLmZvckVhY2gocD0+e2lmKG9uKXAuc2V0QXR0cmlidXRlKCdjb250ZW50ZWRpdGFibGUnLCd0cnVlJyk7ZWxzZSBwLnJlbW92ZUF0dHJpYnV0ZSgnY29udGVudGVkaXRhYmxlJyl9KTsKICAkKCdlZGl0JykudGV4dENvbnRlbnQ9b24/J+KcjiDtjrjsp5Eg64Gd64K06riwJzon4pyOIO2OuOynkSc7CiAgaWYoIW9uKXtzYXZlQWxsKCk7aWYoZG9jdW1lbnQuYWN0aXZlRWxlbWVudClkb2N1bWVudC5hY3RpdmVFbGVtZW50LmJsdXIoKX0KfQokKCdlZGl0Jykub25jbGljaz0oKT0+e3NldEVkaXRpbmcoIWRvY3VtZW50LmJvZHkuY2xhc3NMaXN0LmNvbnRhaW5zKCdlZGl0aW5nJykpOyQoJ2JhcicpLmNsYXNzTGlzdC5yZW1vdmUoJ29wZW4nKX07CiQoJ2RvbmUnKS5vbmNsaWNrPSgpPT5zZXRFZGl0aW5nKGZhbHNlKTsKbGV0IHJhcm09bnVsbDsKJCgncmV2ZXJ0Jykub25jbGljaz0oKT0+ewogIGNvbnN0IGI9JCgncmV2ZXJ0Jyk7CiAgaWYoIXJhcm0pe2IuY2xhc3NMaXN0LmFkZCgnYXJtJyk7Yi50ZXh0Q29udGVudD0n7ZWcIOuyiCDrjZQg64iE66W066m0IOuqqOuRkCDrkJjrj4zrprwnO3Jhcm09c2V0VGltZW91dCgoKT0+e3Jhcm09bnVsbDtiLmNsYXNzTGlzdC5yZW1vdmUoJ2FybScpO2IudGV4dENvbnRlbnQ9J+ybkOuemOuMgOuhnCd9LDI1MDApO3JldHVybn0KICBjbGVhclRpbWVvdXQocmFybSk7cmFybT1udWxsO2IuY2xhc3NMaXN0LnJlbW92ZSgnYXJtJyk7Yi50ZXh0Q29udGVudD0n7JuQ656Y64yA66GcJzsKICBwYXJhcy5mb3JFYWNoKHA9PntwLnRleHRDb250ZW50PXAuZGF0YXNldC5vcmlnO3AuY2xhc3NMaXN0LnJlbW92ZSgnZWRpdGVkJyl9KTtlZGl0cz17fTtzdG9yZS5zZXQoRUtFWSwne30nKTsKfTsKZnVuY3Rpb24gbWFudXNjcmlwdCgpewogIGxldCBvdXQ9JyMgJytkb2N1bWVudC5xdWVyeVNlbGVjdG9yKCdoMScpLmlubmVyVGV4dCsnXG4nOwogIGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJy5zZWMnKS5mb3JFYWNoKChzZWMsaSk9PnsKICAgIG91dCs9J1xuIyMgJytNRVRBW2ldLm5hbWUrJyAoJytNRVRBW2ldLm1pbnMrJ+u2hClcbic7CiAgICBzZWMucXVlcnlTZWxlY3RvckFsbCgnLmJvZHkgPiAqJykuZm9yRWFjaChlbD0+ewogICAgICBpZihlbC5jbGFzc0xpc3QuY29udGFpbnMoJ3JlYWQnKSkgb3V0Kz0nXG5b7ISx6rWsIOuCreuPhTogJytlbC5xdWVyeVNlbGVjdG9yKCcucmVmJykuaW5uZXJUZXh0KyddXG4nOwogICAgICBlbHNlIG91dCs9J1xuJytlbC5pbm5lclRleHQucmVwbGFjZSgvXHMqXG5ccyovZywnICcpLnRyaW0oKSsnXG4nOwogICAgfSk7CiAgfSk7CiAgcmV0dXJuIG91dDsKfQokKCdjb3B5Jykub25jbGljaz1hc3luYygpPT57CiAgc2F2ZUFsbCgpOyBjb25zdCB0eD1tYW51c2NyaXB0KCk7CiAgdHJ5e2F3YWl0IG5hdmlnYXRvci5jbGlwYm9hcmQud3JpdGVUZXh0KHR4KTtjb25zdCBiPSQoJ2NvcHknKTtiLnRleHRDb250ZW50PSfrs7XsgqzrkKgg4pyTJztzZXRUaW1lb3V0KCgpPT5iLnRleHRDb250ZW50PSfsm5Dqs6Ag67O17IKsJywxODAwKX0KICBjYXRjaChlKXskKCdjb3B5dGEnKS52YWx1ZT10eDskKCdjb3B5Ym94JykuY2xhc3NMaXN0LmFkZCgnc2hvdycpOyQoJ2NvcHl0YScpLmZvY3VzKCk7JCgnY29weXRhJykuc2VsZWN0KCl9Cn07CiQoJ2NvcHljbG9zZScpLm9uY2xpY2s9KCk9PiQoJ2NvcHlib3gnKS5jbGFzc0xpc3QucmVtb3ZlKCdzaG93Jyk7CmFwcGx5RnMoKTtyZW5kZXIoKTsKPC9zY3JpcHQ+CjwvYm9keT4KPC9odG1sPgo=";
+
+function parseOutlineText(raw){
+  let {text, total} = cleanOutline(raw);
+  if(!text.trim()) return {error:'붙여넣은 골자가 없습니다.'};
+  const nonEmpty = text.split(/\r?\n/).filter(l=>l.trim());
+  const markRe = new RegExp(MARK_SRC);
+  const nMarks = findMarks(text).length, nMarkLines = nonEmpty.filter(l=>markRe.test(l)).length, oneLiners = nonEmpty.some(l=>findMarks(l).length>=2);
+  let res = null, how = '';
+  if(nMarks>=1 && (oneLiners || nMarkLines<nMarks || nonEmpty.length<=3)){ res = parseFlat(text); how = res ? '(N분) 표시' : ''; }
+  if(!res || res.out.length<2){ const r2 = parseLines(text); if(!res || r2.out.length>res.out.length){ res = r2; how = r2.how; } }
+  if(!res || !res.out.length) return {error:'골자를 나누지 못했습니다. 소재목 줄 끝에 (3분)처럼 시간이 있는지 확인하세요.'};
+  if(res.out.length===1 && res.out[0].title){
+    const pl = res.out[0].points.split('\n').map(x=>x.trim()).filter(Boolean);
+    if(pl.length>=2){ const N = +res.out[0].minutes||0, k = pl.length, base = Math.max(1, Math.floor(N/k)), rem = N>=k ? N-base*k : 0;
+      res.topic = res.out[0].title; if(N) total = N;
+      res.out = pl.map((line,i)=>({title:line.replace(/\s*[(（][^)）]*[)）]/g,'').replace(/\s*\[[^\]]*\]/g,'').replace(/\s+/g,' ').trim()||line, minutes:base+(i<rem?1:0), points:line})); }
+  }
+  const sections = res.out.map(s=>({title:s.title||'', minutes:+s.minutes||3, points:s.points||''}));
+  const pts = sections.reduce((a,s)=>a+s.points.split('\n').filter(Boolean).length,0), scr = sections.reduce((a,s)=>a+extractScriptures(s.points).length,0);
+  return {topic:res.topic||'', notes:res.notes||'', total, sections, msg:`${how} 기준으로 나눔 — 소재목 ${sections.length}개 · 요점 ${pts}개 · 성구 ${scr}개 · 합계 ${sections.reduce((a,s)=>a+s.minutes,0)}분`};
+}
+const Talks = {
+  ids(){ return Object.entries(Store.all('talks')).sort((a,b)=>(b[1].updatedAt||0)-(a[1].updatedAt||0)).map(x=>x[0]); },
+  get(id){ return Store.get('talks', id); },
+  save(t){ t.updatedAt = Date.now(); Store.set('talks', t.id, t); },
+  blank(){ return {id:'t'+Date.now().toString(36), topic:'', total:30, notes:'', sections:[{title:'', minutes:5, points:''}], speech:'', used:''}; },
+  rules(chunked){
+    const r = [
+      "제공된 골자(소재목·요점·시간)와 '유의 사항'을 그대로 따릅니다. 골자에 없는 요점을 새로 만들지 않습니다. 소재목 제목에 연사를 위한 지시문(예: '~을 인식하도록 도우라')이 섞여 있으면 그 지시를 따르되, 소제목에는 실제 제목만 씁니다.",
+      "'성구 본문'이 제공된 성구는 그 본문을 기준으로 인용합니다. 청중이 읽을 성구는 [성구 낭독: 책 장:절] 로 표시하고 그 뜻을 요점과 연결해 설명합니다. 본문이 제공되지 않은 성구는 내용을 지어내지 말고 읽도록만 안내하며, 그 성구의 배경(장소·인물·사건)도 덧붙이지 않습니다.",
+      "'연구 노트·연구 자료 찾아보기'는 연구용 성경과 연구 자료 찾아보기에서 가져온 설명입니다. 성구를 설명할 때 이 요점을 우선 활용하고 출처를 말로 밝힙니다(예: “연구용 성경의 연구 노트에서는…”). 발췌에 없는 내용은 덧붙이지 않습니다.",
+      "'내 자료(출판물) 발췌'와 'jw.org 자료'는 사용자가 선택한 발췌문입니다. 먼저 각 자료의 핵심을 간추린 뒤, 소재목 요점을 설명하는 데 실제로 도움이 되는 내용만 반영하고 출처를 밝힙니다(예: “「성경 통찰」에 이런 설명이 나옵니다”). 발췌문에 없는 통계·인용·일화·출판물 내용을 지어내지 않습니다.",
+      "'경험담·체험기'는 출판물에 실린 실제 경험입니다. 소재목 요점과 직접 관련될 때만 소재목마다 최대 한 개를 약 1분 이내로 간추려 쓰고 출처를 밝힙니다. 발췌문에 없는 이름·장소·대화·결말을 덧붙이지 않으며, 제공된 경험담이 없으면 경험담을 만들지 않습니다.",
+      "골자의 [ ] 안 문장은 연사를 위한 지시입니다. 그대로 읽지 말고 실행합니다. 「순」「파」 같은 출판물 참조(면·항)는 출처 표시이므로, 본문이 자료에 없으면 내용을 지어내지 말고 출처만 자연스럽게 언급합니다.",
+      "jw.org 자료는 성경과 골자를 보충하는 용도로만 쓰고, 의미를 과장하거나 확인되지 않은 적용을 단정하지 않습니다.",
+      "새로운 관심자도 이해할 수 있도록 쉬운 말을 쓰고 전문 용어는 풀어서 설명합니다. 존댓말 구어체로, 청중에게 던지는 질문과 짧은 문장을 섞습니다.",
+      `소재목마다 제시된 시간에 맞는 분량으로 쓰고 소재목 사이를 매끄럽게 연결합니다. 말하는 속도는 분당 약 ${CPM}자(공백 포함)로 계산합니다.`,
+      "골자의 [시각 자료 N] 표시는 그 위치에 [시각 자료 N 사용] 으로 남깁니다.",
+      chunked ? '이 소재목 본문을 쓴 뒤 새 줄에 ###자료### 라고 쓰고, 그 아래에 실제로 사용한 자료(제목·출처)와 제외한 자료와 그 이유를 짧은 목록으로 적습니다. 소재목 제목은 쓰지 않습니다(프로그램이 붙입니다).'
+              : '마지막에 "## 사용한 자료" 항목을 두어 사용한 자료와 제외한 자료를 짧게 적습니다.'
+    ];
+    return '당신은 여호와의 증인의 공개 강연 연설문 초안을 작성하는 도우미입니다. 아래 원칙을 지키십시오.\n' + r.map((x,i)=>`${i+1}. ${x}`).join('\n');
+  },
+  sectionPrompt(t, i, prevTail){
+    const secs = t.sections, s = secs[i], sum = secs.reduce((a,x)=>a+(+x.minutes||0),0), extra = Math.max(0, (+t.total||sum)-sum);
+    const first = i===0, last = i===secs.length-1;
+    const mins = (+s.minutes||0) + (first ? Math.round(extra/2) : 0) + (last ? extra-Math.round(extra/2) : 0);
+    let u = `# 강연 주제\n${t.topic}\n\n# 총 시간\n${t.total}분\n\n# 유의 사항\n${t.notes||'(없음)'}\n\n# 전체 골자\n${secs.map((x,k)=>`${k+1}. ${x.title} (${x.minutes}분)`).join('\n')}\n`;
+    u += `\n# 지금 작성할 소재목: ${i+1}. ${s.title} (${s.minutes}분)\n요점:\n${s.points.split('\n').filter(Boolean).map(l=>'- '+l).join('\n')}\n`;
+    const mat = Research.materialText(`talk:${t.id}#${i}`);
+    u += mat ? `\n# 조사 자료 (사용자가 선택한 것)${mat}\n` : `\n(선택된 조사 자료 없음 — 성경과 골자에 근거해 작성)\n`;
+    if(prevTail) u += `\n# 바로 앞 소재목의 끝부분(자연스럽게 이어 주세요)\n${prevTail}\n`;
+    u += `\n# 요청\n이 소재목의 본문만 작성하십시오. 목표 분량은 약 ${mins*CPM}자(${mins}분)이며 ±10% 안에 맞추십시오.`
+       + (first ? ' 소재목 앞에 주제를 소개하는 짧은 도입을 넣으십시오.' : ' 도입 인사는 넣지 마십시오.')
+       + (last ? ' 마지막에 강연 전체를 마무리하는 결론과 권고를 넣으십시오.' : ' 결론 인사는 넣지 마십시오.');
+    return u;
+  },
+  podiumHTML(t){
+    const raw = t.speech || '';
+    const parts = raw.split(/^##\s+/m).slice(1); if(!parts.length) return null;
+    const tplText = new TextDecoder().decode(Uint8Array.from(atob(PODIUM_TPL), c=>c.charCodeAt(0)));
+    const meta = []; let cum = 0, markup = '';
+    const para = txt => txt.split(/(\[성구 낭독:[^\]]*\])/).map(seg=>{ const m = seg.match(/^\[성구 낭독:\s*([^\]]*)\]$/);
+      return m ? `<div class="read"><span class="tag">성구 낭독</span><span class="ref">${esc(m[1].trim())}</span></div>` : seg.trim() ? `<p>${esc(seg.trim())}</p>` : ''; }).join('');
+    parts.forEach((p,i)=>{ const nl = p.indexOf('\n'), head = (nl<0?p:p.slice(0,nl)).trim(), body = nl<0?'':p.slice(nl+1);
+      const mm = head.match(/\((\d+)\s*분\)/), mins = mm ? +mm[1] : 0, name = head.replace(/\((\d+)\s*분\)\s*$/,'').replace(/^소재목\s*\d+\.\s*/,'').trim();
+      markup += `<section class="sec" id="s${i}" data-i="${i}"><header class="sh" data-i="${i}"><div class="sn">${i+1}</div><div class="st"><h2>${esc(name)}</h2><div class="meta">배정 ${mins}분 · 목표 ${cum}:00 → ${cum+mins}:00 <span class="actual" id="a${i}"></span></div></div></header><div class="body">${body.split(/\n\s*\n/).map(x=>x.replace(/\n/g,' ').trim()).filter(Boolean).map(para).join('\n')}</div></section>\n`;
+      meta.push({name, mins, start:cum}); cum += mins; });
+    const refs = (t.used||'').trim();
+    const refHtml = refs ? '<ul>'+refs.split('\n').filter(l=>l.trim()).map(l=>`<li>${esc(l.replace(/^[-•*]\s*/,''))}</li>`).join('')+'</ul>' : '<p>(없음)</p>';
+    return tplText.split('%%TITLE%%').join(esc(t.topic||'연설문')).replace('%%SECTIONS%%', markup).replace('%%REFS%%', refHtml).replace('%%META%%', JSON.stringify(meta)).split('%%TOTAL%%').join(String(cum || t.total));
+  }
+};
+let talkAbort = null;
+
+
+/* =========================================================
+   5-5. 파수대 연구 · 영적 보물 · 성경 읽기 본문
+   wt[주]   = { title, theme, song, summary, paras:[{qn:'1', q, text, head, cap}], review:[q], src, ans:{qn:{short, long, mine}} }
+   bible[주] = { range, text }      gems[주] = { out, mine }
+   ========================================================= */
+const WT = {
+  parse(raw){
+    const lines = String(raw).replace(/\ufeff/g,'').split(/\r?\n/).map(l=>l.replace(/\s+$/,''));
+    const a = {title:'', theme:'', song:'', summary:'', paras:[], review:[], src:'', ans:{}};
+    let i = 0, head = '', cur = null, inReview = false, pre = [];
+    const skip = l => /^답을 적는 칸$/.test(l.trim());
+    for(; i<lines.length; i++){
+      const l = lines[i].trim(); if(!l || skip(l)) continue;
+      let m;
+      if((m = l.match(/^출처:\s*(\S+)/))){ a.src = m[1]; continue; }
+      if(/^어떻게 대답하시겠습니까\?/.test(l)){ inReview = true; cur = null; continue; }
+      if(inReview){ if(/^노래\s*\d+/.test(l)) { inReview = false; continue; } if(!/^[a-z]\s/.test(l)) a.review.push(l); continue; }
+      if((m = l.match(/^(\d{1,2}(?:\s*[,-]\s*\d{1,2})?)\.\s+(.+)$/))){ cur = {qn:m[1].replace(/\s+/g,''), q:m[2], text:'', head, cap:''}; head = ''; a.paras.push(cur); continue; }
+      if(!a.paras.length){ pre.push(l); continue; }
+      if(/^[a-z]\s/.test(l) || /^노래\s*\d+/.test(l)) continue;
+      if(/\(\d+(?:[-,]\d+)?항 참조\)$/.test(l)){ if(cur) cur.cap += (cur.cap?'\n':'') + l; continue; }
+      if(cur && (/^\d{1,2}\s/.test(l) || (!cur.text && l.length > 40))){ cur.text += (cur.text?'\n':'') + l.replace(/^\d{1,2}\s/,''); continue; }
+      if(cur && cur.text && l.length <= 40 && !/[.?!”」)]$/.test(l)){ head = l; continue; }
+      if(cur) cur.text += (cur.text?'\n':'') + l;
+    }
+    /* 머리말: 날짜, 노래, 제목, 주제 성구, 요점 */
+    pre = pre.filter(l=>!/^\d{4}년\s*\d{1,2}월/.test(l));
+    const si = pre.findIndex(l=>/^노래\s*\d+/.test(l)); if(si>=0){ a.song = pre[si]; pre.splice(si,1); }
+    a.title = pre.shift() || '';
+    const ti = pre.findIndex(l=>/^“.+”—/.test(l) || /^".+"—/.test(l)); if(ti>=0){ a.theme = pre[ti]; pre.splice(ti,1); }
+    const yi = pre.indexOf('요점'); if(yi>=0) a.summary = pre.slice(yi+1).join(' ');
+    return a;
+  },
+  rules: `당신은 여호와의 증인의 「파수대」 연구 집회 해설(댓글)을 준비하도록 돕는 도우미입니다.
+1. 답변은 해당 항의 본문과 그 항에 나오는 성구에 근거합니다. 본문에 없는 주장·통계·일화를 지어내지 않습니다.
+2. 존댓말 구어체로, 회중 앞에서 손을 들고 말하는 해설처럼 자연스럽게 씁니다.
+3. 성구를 인용할 때는 본문에 나온 성구만 쓰고, 성구의 내용을 지어내지 않습니다.
+4. 제공된 '조사 자료'가 있으면 출처를 밝혀 보충으로만 씁니다.`,
+  allShortPrompt(a){
+    return `# 연구 기사: ${a.title}\n${a.theme}\n\n` + a.paras.map(p=>`## 질문 ${p.qn}. ${p.q}\n[${p.qn}항]\n${p.text}`).join('\n\n')
+      + `\n\n# 요청\n질문마다 회중 해설로 쓸 1-2문장(30초 이내) 답변을 쓰십시오. 형식은 정확히 다음과 같이 하십시오.\n### 질문 번호\n답변\n(예: ### 3\n…)`;
+  },
+  onePrompt(a, p, kind, mat){
+    const what = kind==='long' ? '근거가 되는 본문 내용과 성구를 들어 3-5문장으로 자세히 답하고, 이어서 "덧붙일 수 있는 요점"을 1-2개 적으십시오.'
+               : kind==='verse' ? '이 항에 나오는 성구들을 하나씩 들어, 그 성구가 질문의 답과 어떻게 연결되는지 해설용으로 1-2문장씩 설명하십시오.'
+               : '회중 해설로 쓸 1-2문장(30초 이내) 답변을 쓰십시오.';
+    return `# 연구 기사: ${a.title}\n${a.theme}\n\n## 질문 ${p.qn}. ${p.q}\n[${p.qn}항]\n${p.text}${p.cap ? '\n[삽화 설명] '+p.cap : ''}${mat ? '\n\n# 조사 자료'+mat : ''}\n\n# 요청\n${what}`;
+  }
+};
+const Gems = {
+  rules: `당신은 여호와의 증인 평일 집회의 '영적 보물 찾기' 해설 준비를 돕는 도우미입니다.
+1. 교재 질문과 성경 읽기 본문, 제공된 조사 자료(연구 노트·연구 자료 찾아보기·출판물 발췌)에 근거해 답합니다.
+2. 교재가 가리킨 출판물(「예레」 165면 등)의 본문이 자료에 없으면 내용을 지어내지 말고 '확인 필요'와 함께 출처만 적습니다.
+3. 존댓말 구어체 해설 문장으로 씁니다.`,
+  prompt(w, part, bible, mat){
+    return `# 이번 주: ${w.label} · 성경 읽기 ${w.reading}\n\n# 교재 '영적 보물 찾기'\n${part ? part.detail : '(교재 내용 없음)'}\n`
+      + (bible ? `\n# 성경 읽기 본문 (신세계역 연구용)\n${bible.slice(0, 14000)}\n` : '')
+      + (mat ? `\n# 조사 자료${mat}\n` : '')
+      + `\n# 요청\n1) 질문 1(성구 질문)에 대한 해설 답변: 30초 분량 1개와, 다른 각도의 부가 답변 2개\n2) 질문 2 "이번 주 성경 읽기를 통해 어떤 영적 보물을 발견했습니까?"에 쓸 수 있는 영적 보물 3개 (각각 성구 장:절 + 1-2문장 해설 + 적용점)\n소제목을 붙여 읽기 쉽게 쓰십시오.`;
+  }
+};
+/* D:\JW 파일 이름으로 종류 나누기: …_집회교재_… / …_성경범위_… / 그 밖의 날짜 파일 = 파수대 연구 기사 */
+async function importJWFiles(files){
+  const res = {weeks:[], wt:0, bible:0};
+  for(const f of files){
+    const text = await f.text(), name = f.name;
+    const d = (name.match(/^(\d{4}-\d{2}-\d{2})_/)||[])[1];
+    if(/집회교재/.test(name) || (!d && /성경에 담긴 보물/.test(text))){ res.weeks.push(...Weeks.parseWorkbook(text, name)); continue; }
+    const wid = d ? Weeks.ymd(Weeks.monday(new Date(d+'T00:00:00'))) : null;
+    if(/성경범위/.test(name) && wid){ Store.set('bible', wid, {range:(name.match(/성경범위_(.+)\.txt$/)||[])[1]||'', text}); res.bible++; continue; }
+    if(wid){ const a = WT.parse(text); if(a.paras.length){ const old = Store.get('wt', wid); if(old && old.ans) a.ans = old.ans; Store.set('wt', wid, a); res.wt++; } }
+  }
+  return res;
+}
+/* 주 고르기 막대(파수대·영적 보물 화면 공용) */
+function weekBar(el, ids, id, onGo){
+  const i = ids.indexOf(id);
+  return `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+    <button class="btn ghost sm" data-wk="prev" ${i<=0?'disabled':''}>◀</button>
+    <select data-wk="sel" style="flex:1;min-width:180px">${ids.map(x=>`<option value="${x}" ${x===id?'selected':''}>${esc(Weeks.labelOf(x))}${x===Weeks.thisId()?' (이번 주)':''}</option>`).join('')}</select>
+    <button class="btn ghost sm" data-wk="next" ${i>=ids.length-1?'disabled':''}>▶</button></div>`;
+}
+function bindWeekBar(el, ids, id){
+  const go = x => { if(x){ Settings.set('weekSel', x); render(); } };
+  const s = $('[data-wk=sel]', el); if(!s) return;
+  s.onchange = e=>go(e.target.value);
+  $('[data-wk=prev]', el).onclick = ()=>go(ids[ids.indexOf(id)-1]);
+  $('[data-wk=next]', el).onclick = ()=>go(ids[ids.indexOf(id)+1]);
+}
+function pickWeek(ids){ let id = Settings.get('weekSel') || Weeks.thisId(); if(!ids.includes(id)) id = ids.find(x=>x >= Weeks.thisId()) || ids[ids.length-1] || null; return id; }
+function legacyFor(label){
+  const all = Store.all('legacyMeeting'), out = [];
+  for(const k in all){ if(label && k.includes(label) && /_out_/.test(k) && all[k]) out.push({k, v:all[k]}); }
+  return out;
+}
+let wtAbort = null;
+
+
+/* =========================================================
+   5-6. 연설·실연 연습
+   practice['주#번호'] = { script, mine, feedback }
+   ========================================================= */
+const Practice = {
+  kind(p){
+    if(!p) return 'talk';
+    if(/성경 낭독/.test(p.title)) return 'reading';
+    if(p.sec==='ministry') return /연설/.test(p.title) ? 'talk' : 'demo';
+    if(p.sec==='treasure' && p.no===1) return 'talk';
+    if(/영적 보물/.test(p.title)) return 'gems';
+    return p.sec==='life' ? 'life' : 'talk';
+  },
+  label: {talk:'연설', demo:'실연(대화)', reading:'성경 낭독', gems:'영적 보물', life:'그리스도인 생활 순서'},
+  rules: `당신은 여호와의 증인 평일 집회 과제를 준비하도록 돕는 도우미입니다.
+1. 교재에 적힌 요점·성구·장면 설정을 그대로 따르고, 없는 요점을 만들지 않습니다.
+2. 성구 본문이 제공되지 않은 성구는 내용을 지어내지 말고 [성구 낭독: 책 장:절] 로 표시해 읽도록 안내합니다.
+3. 「랑제」「읽가」 같은 출판물의 과·요점은 제목만 언급하고, 그 내용을 지어내지 않습니다.
+4. 제공된 조사 자료를 쓸 때는 출처를 말로 밝힙니다.
+5. 존댓말 구어체로, 실제로 말하기 쉽게 씁니다.`,
+  scriptPrompt(w, p, kind, mat){
+    const base = `# 주: ${w.label} · 성경 읽기 ${w.reading}\n# 과제: ${p.no}. ${p.title} (${p.min}분)\n# 장면·부제: ${p.sub||'-'}\n# 교재 내용\n${p.detail||'(없음)'}\n${mat ? '\n# 조사 자료'+mat+'\n' : ''}`;
+    if(kind==='demo') return base + `\n# 요청\n${p.min}분 안에 할 수 있는 실연 예시 대본을 쓰십시오. 전도인(학생)과 집주인 두 사람의 대화로, 장면 설정을 그대로 따르고 교재가 가리킨 과·요점을 실연에서 보여 주도록 합니다. 대본 앞에 "이 실연의 목표" 2줄, 대본 뒤에 "연습할 때 기억할 점" 3개를 적으십시오. 대화 줄은 "전도인:" "집주인:"으로 시작하십시오.`;
+    if(kind==='reading') return base + `\n# 요청\n이 성경 낭독을 연습하도록 도와주십시오. ① 낭독 범위에서 강조해 읽을 낱말·구절과 쉼표에서 쉬어 읽을 곳을 알려 주고 ② 읽기 어려운 낱말(지명·인명)의 읽는 법을 적고 ③ 교재가 가리킨 과의 이름만 언급하며 연습 방법 3가지를 적으십시오. 성구 본문이 제공되지 않았다면 본문을 지어내지 마십시오.`;
+    if(kind==='life') return base + `\n# 요청\n이 순서를 맡은 사람이 쓸 진행 메모를 만드십시오: 도입 한두 문장, 교재 질문별로 청중에게 물을 질문과 기대 답 요지, 마무리 적용 한두 문장.`;
+    return base + `\n# 요청\n약 ${p.min*330}자(${p.min}분) 분량의 연설문을 쓰십시오. 교재 요점을 순서대로 다루고, 짧은 도입과 실제적인 적용·결론을 넣으십시오.`;
+  },
+  feedbackPrompt(w, p, kind, script, mine, secs){
+    return `# 과제: ${p.no}. ${p.title} (${p.min}분) · ${p.sub||''}\n# 교재 내용\n${p.detail||'-'}\n# 준비한 예시 대본·연설문\n${script||'(없음)'}\n# 내 실연(말한 내용을 받아 적은 것)\n${mine}\n# 걸린 시간\n${secs ? Math.floor(secs/60)+'분 '+(secs%60)+'초' : '측정 안 함'} / 목표 ${p.min}분\n\n# 요청\n따뜻하지만 정직하게 피드백을 주십시오. ① 잘한 점 2가지 ② 고치면 좋을 점 2가지(구체적인 바꿀 문장 예시 포함) ③ 시간 조절 조언 ④ 교재가 가리킨 과·요점을 실연에서 잘 보여 주었는지 — 과의 내용을 지어내지 말고 교재 문구만 근거로 판단하십시오.`;
+  }
+};
+let prAbort = null, prRec = null, prChunks = [], prTimer = null;
+
 /* =========================================================
    6. 화면 (뷰)
    ========================================================= */
@@ -933,7 +1290,7 @@ const Views = {
           <li><span class="ic">${sync.state!=='off'?'✅':'2️⃣'}</span><div><b>기기 간 동기화</b><span>GitHub 토큰을 넣으면 폰·태블릿·PC가 같은 내용을 봅니다.</span></div></li>
         </ul><div class="row"><a class="btn sm" href="#settings">설정 열기</a></div></details>` : '';
     const importCard = `<div class="card" id="impCard"><h2>📥 집회 교재 불러오기</h2>
-        <p class="desc">D:\\JW의 “…_집회교재_….txt” 파일을 여러 개 한꺼번에 고르거나, jw.org의 ‘생활과 봉사 집회 교재’ 글을 복사해 붙여넣으세요. 이미 있는 주는 교재 내용만 바뀌고 이름 배정은 그대로 남습니다.</p>
+        <p class="desc">D:\\JW의 txt 파일(집회교재·성경범위·연구 기사)을 여러 개 한꺼번에 고르거나, jw.org의 ‘생활과 봉사 집회 교재’ 글을 복사해 붙여넣으세요. 이미 있는 주는 교재 내용만 바뀌고 이름 배정은 그대로 남습니다.</p>
         <div class="row" style="margin-top:0"><button class="btn" id="impFiles">교재 파일 고르기 (.txt)</button><input type="file" id="impFile" accept=".txt,text/plain" multiple hidden>
           <button class="btn ghost" id="impPasteBtn">글 붙여넣기</button><button class="btn ghost" id="impOld">기존 임명표에서 가져오기</button></div>
         <div id="impPasteBox" hidden><textarea id="impPaste" placeholder="11월 9-15일&#10;예레미야 51-52장&#10;노래 98 및 기도 | 소개말 (1분)&#10;…"></textarea><div class="row"><button class="btn sm" id="impPasteGo">이 글로 만들기</button></div></div>
@@ -1021,7 +1378,9 @@ const Views = {
       <div class="card"><h2>🔎 이번 주 자료 조사</h2><p class="desc">순서를 고르면 그 순서의 성구와 핵심어가 자동으로 채워집니다. 조사한 자료는 순서별로 저장되어 해설·연설 작성에 쓰입니다.</p>
         <label>조사할 순서</label><select id="rTarget">${w.parts.map(p=>`<option value="${p.no}">${p.no}. ${esc(p.title)}</option>`).join('')}</select>
         <div id="weekR" style="margin-top:6px"></div></div>
-      ${planCard([['📋','적용점 모아보기','보물 연설·영적 보물·야외 봉사 적용점을 한곳에 모읍니다.','4단계 이후']])}
+      <div class="card"><h2>📋 이번 주 적용점 모아보기</h2><p class="desc">교재 순서마다 생활과 봉사에 적용할 점을 한두 문장씩 모아 줍니다.</p>
+        <div class="row" style="margin-top:0"><button class="btn ghost" id="apGo">적용점 만들기</button></div><div class="st" id="apSt"></div>
+        ${Store.get('weekApply', w.id) ? `<div class="note" style="white-space:pre-line">${esc(Store.get('weekApply', w.id))}</div>` : ''}</div>
       <datalist id="nameList">${Weeks.names().map(n=>`<option value="${esc(n)}">`).join('')}</datalist>`;
 
     /* 저장 */
@@ -1047,6 +1406,12 @@ const Views = {
       if(!d || isNaN(d)){ toast('날짜를 2026-11-23 형식으로 넣어 주세요.'); return; }
       const nid = Weeks.ymd(Weeks.monday(d)); if(!Weeks.get(nid)) Weeks.save(Weeks.blank(nid)); go(nid); };
     bindImport(el);
+    $('#apGo').onclick = async ()=>{ const st = $('#apSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+      st.className='st'; st.textContent='만드는 중…'; $('#apGo').disabled = true;
+      try{ const txt = await AI.write({system:'당신은 여호와의 증인 평일 집회 교재에서 실제적인 적용점을 뽑아 주는 도우미입니다. 교재에 없는 내용을 지어내지 않습니다.',
+          prompt:`# ${w.label} · ${w.reading}\n` + w.parts.map(p=>`## ${p.no}. ${p.title} (${p.sub||''})\n${p.detail||''}`).join('\n\n') + '\n\n# 요청\n순서마다 “적용점:” 한두 문장을 쓰고, 마지막에 이번 주 가족·개인 연구에서 해 볼 일 3가지를 적으십시오.', maxTokens:3000});
+        Store.set('weekApply', w.id, txt); render(); }
+      catch(e){ st.className='st err'; st.textContent='오류: '+e.message; $('#apGo').disabled = false; } };
     /* 이번 주 자료 조사 */
     const mountR = () => { const no = +$('#rTarget', el).value; const p = w.parts.find(x=>x.no===no) || {};
       const src = [p.title, p.sub, p.detail].join('\n');
@@ -1056,41 +1421,316 @@ const Views = {
     if($('#rTarget', el)){ const last = Settings.get('rTarget:'+w.id); if(last) $('#rTarget', el).value = last; $('#rTarget', el).onchange = ()=>{ Settings.set('rTarget:'+w.id, $('#rTarget', el).value); mountR(); }; mountR(); }
   },
   wt(el){
-    el.innerHTML = `<section class="hero"><div class="kicker">연구 기사</div><h1>파수대 연구</h1><p>이번 주 연구 기사의 질문마다 댓글용 답변, 성구 해설, 삽화·적용을 준비합니다.</p><div class="big">📖</div></section>`
-      + planCard([
-        ['📰','이번 달 연구 기사 목록','주차에 맞는 기사와 원문 링크','5단계'],
-        ['💬','질문별 답변 만들기','댓글용(1-2문장)·자세히(근거와 성구) 두 가지','5단계'],
-        ['📜','성구 해설','연구 노트·연구 자료 찾아보기를 근거로','5단계'],
-        ['💾','답변 저장·동기화','주마다 저장하고 다른 기기에서도 보기','5단계']
-      ]);
+    const ids = [...new Set([...Weeks.ids(), ...Object.keys(Store.all('wt'))])].sort();
+    const id = pickWeek(ids);
+    const a = id ? Store.get('wt', id) : null;
+    const imp = `<div class="card"><h2>📥 연구 기사 불러오기</h2><p class="desc">D:\\JW의 “2026-11-09_기사 제목.txt” 같은 연구 기사 파일을 고르세요. 집회교재·성경범위 파일을 함께 골라도 알아서 나눠 저장합니다. 또는 기사 본문 전체를 붙여넣으세요.</p>
+      <div class="row" style="margin-top:0"><button class="btn" data-act="wtFiles">파일 고르기 (.txt)</button><input type="file" data-act="wtFile" accept=".txt,text/plain" multiple hidden><button class="btn ghost" data-act="wtPasteBtn">본문 붙여넣기</button></div>
+      <div data-act="wtPasteBox" hidden><textarea data-act="wtPaste" placeholder="2026년 11월 9-15일&#10;노래 36 …&#10;기사 제목&#10;…"></textarea><div class="row"><button class="btn sm" data-act="wtPasteGo">이 주에 넣기</button></div></div>
+      <div class="st" data-act="wtSt"></div></div>`;
+    const head = `<section class="hero"><div class="kicker">${id ? esc(Weeks.labelOf(id))+' · ' : ''}파수대 연구</div><h1>${a ? esc(a.title) : '파수대 연구'}</h1><p>${a ? esc(a.theme) : '연구 기사를 불러오면 질문마다 해설 답변을 준비할 수 있습니다.'}</p><div class="big">📖</div></section>`;
+    el.innerHTML = head + (ids.length ? weekBar(el, ids, id) : '') + (a ? '' : imp);
+    bindWeekBar(el, ids, id);
+    const bindImp = () => {
+      const st = $('[data-act=wtSt]', el); if(!st) return;
+      $('[data-act=wtFiles]', el).onclick = ()=>$('[data-act=wtFile]', el).click();
+      $('[data-act=wtFile]', el).onchange = async e=>{ const r = await importJWFiles([...e.target.files]); e.target.value=''; r.weeks.forEach(w=>Weeks.mergeInto(w));
+        st.className='st ok'; st.textContent = `연구 기사 ${r.wt}개, 교재 ${r.weeks.length}주, 성경 읽기 ${r.bible}개를 불러왔습니다.`; setTimeout(render, 1200); };
+      $('[data-act=wtPasteBtn]', el).onclick = ()=>{ const b = $('[data-act=wtPasteBox]', el); b.hidden = !b.hidden; };
+      $('[data-act=wtPasteGo]', el).onclick = ()=>{ const a2 = WT.parse($('[data-act=wtPaste]', el).value); const wid = id || Weeks.thisId();
+        if(!a2.paras.length){ st.className='st err'; st.textContent='질문과 항을 찾지 못했습니다.'; return; } Store.set('wt', wid, a2); render(); };
+    };
+    if(!a){ bindImp(); return; }
+    const ans = a.ans || {};
+    const leg = legacyFor(Weeks.labelOf(id)).filter(x=>/^wt_/.test(x.k));
+    el.insertAdjacentHTML('beforeend', `
+      <style>.qcard{border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-top:12px;background:var(--surface)}
+        .qcard .qh{font-weight:700;display:flex;gap:8px} .qcard .qh .n{flex:none;min-width:30px;height:30px;border-radius:9px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-size:.85rem;padding:0 6px}
+        .qcard .sub{color:var(--accent);font-weight:700;font-size:.9rem;margin:6px 0 2px} .qans{white-space:pre-line;background:var(--accent-soft);border-radius:10px;padding:10px 12px;margin-top:8px;font-size:.95rem}
+        .qans b{display:block;font-size:.78rem;color:var(--accent);margin-bottom:2px}</style>
+      <div class="card"><h2>🧭 이 기사</h2>
+        ${a.song ? `<p class="desc">🎵 ${esc(a.song)}</p>` : ''}${a.summary ? `<p class="note"><b>요점</b> ${esc(a.summary)}</p>` : ''}
+        <div class="row"><button class="btn" id="wtAll">💬 모든 질문 댓글용 답변 만들기</button><button class="btn danger" id="wtStop" disabled>중지</button><button class="btn ghost" id="wtCopy">답변 모두 복사</button>${a.src ? `<a class="btn ghost" href="${esc(a.src)}" target="_blank" rel="noopener">원문 ↗</a>` : ''}</div>
+        <div class="st" id="wtSt"></div>
+        ${leg.length ? `<details class="more"><summary>기존 집회 계획표에서 가져온 답변 ${leg.length}개</summary>${leg.map(x=>`<div class="qans">${esc(x.v)}</div>`).join('')}</details>` : ''}
+      </div>
+      ${a.paras.map(p=>{ const an = ans[p.qn] || {}; return `<div class="qcard" data-qn="${esc(p.qn)}">
+        ${p.head ? `<div class="sub">▍${esc(p.head)}</div>` : ''}
+        <div class="qh"><span class="n">${esc(p.qn)}</span><span>${esc(p.q)}</span></div>
+        <details class="pd"><summary>${esc(p.qn)}항 본문 보기</summary><div>${esc(p.text).replace(/\n/g,'<br>')}${p.cap ? `<br><i>🖼 ${esc(p.cap)}</i>` : ''}</div></details>
+        ${an.short ? `<div class="qans"><b>댓글용</b>${esc(an.short)}</div>` : ''}${an.long ? `<div class="qans"><b>자세히</b>${esc(an.long)}</div>` : ''}${an.verse ? `<div class="qans"><b>성구 해설</b>${esc(an.verse)}</div>` : ''}
+        <div class="row"><button class="btn sm" data-k="short">댓글용</button><button class="btn sm ghost" data-k="long">자세히</button><button class="btn sm ghost" data-k="verse" ${extractScriptures(p.text).length?'':'disabled'}>성구 해설</button><button class="btn sm ghost" data-k="research">🔎 자료</button></div>
+        <div class="rbox" hidden style="margin-top:8px"></div>
+        <label>내 해설 메모</label><textarea data-k="mine" style="min-height:60px" placeholder="내가 말할 해설을 적어 두세요.">${esc(an.mine||'')}</textarea>
+      </div>`; }).join('')}
+      ${a.review.length ? `<div class="card" style="margin-top:14px"><h2>❓ 복습 질문</h2><ul class="plan">${a.review.map(q=>`<li><span class="ic">•</span><div>${esc(q)}</div></li>`).join('')}</ul></div>` : ''}
+      <details class="more" style="margin-top:14px"><summary>다른 기사 불러오기·바꾸기</summary>${imp}</details>`);
+    bindImp();
+    const saveAns = () => { const cur = Store.get('wt', id) || a; cur.ans = ans; Store.set('wt', id, cur); };
+    $$('.qcard', el).forEach(card=>{
+      const p = a.paras.find(x=>x.qn===card.dataset.qn); ans[p.qn] ||= {};
+      const memo = $('textarea[data-k=mine]', card); let tm; memo.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>{ ans[p.qn].mine = memo.value; saveAns(); }, 400); };
+      $$('button[data-k]', card).forEach(b=>b.onclick = async ()=>{
+        const k = b.dataset.k;
+        if(k==='research'){ const box = $('.rbox', card); box.hidden = !box.hidden; if(!box.hidden && !box.dataset.on){ box.dataset.on = 1; Research.mount(box, `wt:${id}#${p.qn}`, {refs:[...new Set(extractScriptures(p.text))], kws:keywordsOfText(p.q+' '+p.text, 6), title:`${a.title} ${p.qn}항`}); } return; }
+        if(!AI.mode()){ toast('설정에서 AI를 먼저 연결해 주세요.'); return; }
+        b.disabled = true; const old = b.textContent; b.textContent = '작성 중…';
+        try{ const txt = await AI.write({system:WT.rules, prompt:WT.onePrompt(a, p, k, Research.materialText(`wt:${id}#${p.qn}`)), maxTokens:2000});
+          ans[p.qn][k] = txt.trim(); saveAns(); render(); }
+        catch(e){ toast('오류: '+e.message); b.disabled = false; b.textContent = old; }
+      });
+    });
+    $('#wtAll').onclick = async ()=>{
+      const st = $('#wtSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+      wtAbort = new AbortController(); $('#wtAll').disabled = true; $('#wtStop').disabled = false; st.className='st';
+      try{ const txt = await AI.write({system:WT.rules, prompt:WT.allShortPrompt(a), signal:wtAbort.signal, maxTokens:6000, onText:x=>{ st.textContent = `작성 중… ${(x.match(/^###/mg)||[]).length}/${a.paras.length}`; }});
+        let n = 0; txt.split(/^###\s*/m).slice(1).forEach(chunk=>{ const nl = chunk.indexOf('\n'); const qn = chunk.slice(0, nl).replace(/[^\d,-]/g,''); const body = chunk.slice(nl+1).trim();
+          const key = a.paras.find(p=>p.qn===qn) ? qn : (a.paras.find(p=>p.qn.split(/[,-]/)[0]===qn.split(/[,-]/)[0])||{}).qn; if(key && body){ ans[key] ||= {}; ans[key].short = body; n++; } });
+        saveAns(); st.className='st ok'; st.textContent = `${n}개 질문의 답변을 만들었습니다.`; setTimeout(render, 800);
+      }catch(e){ st.className='st err'; st.textContent = e.name==='AbortError' ? '중지했습니다.' : '오류: '+e.message; }
+      $('#wtAll').disabled = false; $('#wtStop').disabled = true; wtAbort = null;
+    };
+    $('#wtStop').onclick = ()=>{ if(wtAbort) wtAbort.abort(); };
+    $('#wtCopy').onclick = async ()=>{ const txt = a.paras.map(p=>{ const an = ans[p.qn]||{}; return `${p.qn}. ${p.q}\n${an.mine || an.short || ''}`; }).join('\n\n');
+      try{ await navigator.clipboard.writeText(txt); toast('답변을 복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
   },
   gems(el){
-    el.innerHTML = `<section class="hero"><div class="kicker">성경에 담긴 보물</div><h1>영적 보물 찾기</h1><p>이번 주 성경 읽기 범위에서 질문 1·2의 해설과 부가 답변을 준비합니다.</p><div class="big">💎</div></section>`
-      + planCard([
-        ['📄','교재 본문·참조 출판물 자동 불러오기','주차를 고르면 교재와 성경 본문이 채워집니다.','5단계'],
-        ['🔎','성구 조사','연구 노트·연구 자료 찾아보기·내 자료','3단계'],
-        ['✍️','해설과 부가 답변 만들기','출처를 밝히고 지어내지 않는 원칙','5단계']
-      ]);
+    const ids = Weeks.ids(); const id = pickWeek(ids);
+    if(!id){ el.innerHTML = `<section class="hero"><div class="kicker">성경에 담긴 보물</div><h1>영적 보물 찾기</h1><p>먼저 ‘이번 주’에서 집회 교재를 불러와 주세요.</p><div class="big">💎</div></section><div class="row"><a class="btn" href="#week">이번 주로 가기</a></div>`; return; }
+    const w = Weeks.get(id), part = (w.parts||[]).find(p=>/영적 보물/.test(p.title));
+    const bible = Store.get('bible', id), g = Store.get('gems', id) || {};
+    const leg = legacyFor(w.label).filter(x=>/^st_/.test(x.k));
+    const refs = part ? [...new Set(extractScriptures(part.detail))] : [];
+    el.innerHTML = `<section class="hero"><div class="kicker">${esc(w.label)} · 성경에 담긴 보물</div><h1>영적 보물 찾기</h1><p>📖 ${esc(w.reading||'')} ${part && part.who ? ' · 맡은 사람 '+esc(part.who) : ''}</p><div class="big">💎</div></section>
+      ${weekBar(el, ids, id)}
+      <div class="card"><h2>📄 교재 질문</h2>${part ? `<div class="note" style="white-space:pre-line;margin-top:0">${esc(part.detail)}</div>` : '<p class="desc">이 주의 교재에 영적 보물 찾기 순서가 없습니다.</p>'}
+        <p class="desc" style="margin-top:10px">성경 읽기 본문: ${bible ? `✅ ${esc(bible.range||w.reading)} (${bible.text.length.toLocaleString()}자)` : '없음 — D:\\JW의 “…_성경범위_….txt”를 파수대 화면이나 아래에서 불러오면 해설에 함께 쓰입니다.'}</p>
+        ${bible ? '' : `<div class="row" style="margin-top:0"><button class="btn ghost sm" id="gBible">성경범위 파일 고르기</button><input type="file" id="gBibleFile" accept=".txt" multiple hidden></div>`}</div>
+      <div class="card"><h2>🔎 자료 조사</h2><p class="desc">질문 1의 성구와 교재가 가리킨 출판물을 찾습니다. 체크한 자료가 해설에 쓰입니다.</p><div id="gR"></div></div>
+      <div class="card"><h2>✍️ 해설과 부가 답변</h2>
+        <div class="row" style="margin-top:0"><button class="btn" id="gGo">해설 만들기</button><button class="btn ghost" id="gCopy">복사</button></div><div class="st" id="gSt"></div>
+        <textarea id="gOut" style="min-height:260px;margin-top:10px" placeholder="만든 해설이 여기에 나옵니다. 직접 고칠 수 있습니다.">${esc(g.out||'')}</textarea>
+        ${leg.length ? `<details class="more"><summary>기존 집회 계획표에서 가져온 해설 ${leg.length}개</summary>${leg.map(x=>`<div class="note" style="white-space:pre-line">${esc(x.v)}</div>`).join('')}</details>` : ''}</div>`;
+    bindWeekBar(el, ids, id);
+    Research.mount($('#gR', el), `gems:${id}`, {refs, kws:part ? keywordsOfText(part.detail, 6) : [], title:`${w.label} 영적 보물`});
+    if($('#gBible')){ $('#gBible').onclick = ()=>$('#gBibleFile').click(); $('#gBibleFile').onchange = async e=>{ await importJWFiles([...e.target.files]); render(); }; }
+    const out = $('#gOut'); let tm; out.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>Store.set('gems', id, {...(Store.get('gems', id)||{}), out:out.value}), 400); };
+    $('#gGo').onclick = async ()=>{ const st = $('#gSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+      $('#gGo').disabled = true; st.className='st'; st.textContent='작성 중…';
+      try{ const txt = await AI.write({system:Gems.rules, prompt:Gems.prompt(w, part, bible && bible.text, Research.materialText(`gems:${id}`)), maxTokens:5000, onText:x=>{ out.value = x; }});
+        Store.set('gems', id, {...(Store.get('gems', id)||{}), out:txt}); st.className='st ok'; st.textContent='완료 — 직접 고쳐서 쓰세요.'; }
+      catch(e){ st.className='st err'; st.textContent='오류: '+e.message; }
+      $('#gGo').disabled = false; };
+    $('#gCopy').onclick = async ()=>{ try{ await navigator.clipboard.writeText(out.value); toast('복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
   },
   talk(el){
-    el.innerHTML = `<section class="hero"><div class="kicker">야외 봉사 실연 · 학생 과제</div><h1>연설·실연</h1><p>이번 과제의 적용점으로 예시 대본을 만들고, 말하기 연습과 녹음, 피드백까지 한곳에서 합니다.</p><div class="big">🎤</div></section>`
-      + planCard([
-        ['📝','10분 연설 작성','보물 연설 골자로 시간에 맞춘 연설문','4단계'],
-        ['🎭','실연 예시 대본','적용점으로 대화 예시 만들기','6단계'],
-        ['⏱️','말하기 연습·타이머','목표 시간 표시와 초과 알림','6단계'],
-        ['🎙️','녹음과 피드백','내 실연을 녹음하고 AI 피드백 받기','6단계']
-      ]);
+    const ids = Weeks.ids(); const id = pickWeek(ids);
+    if(!id){ el.innerHTML = `<section class="hero"><div class="kicker">연습</div><h1>연설·실연</h1><p>먼저 ‘이번 주’에서 집회 교재를 불러와 주세요.</p><div class="big">🎤</div></section><div class="row"><a class="btn" href="#week">이번 주로 가기</a></div>`; return; }
+    const w = Weeks.get(id), parts = w.parts||[];
+    const mineFirst = parts.find(p=>Weeks.isMine(p.who));
+    let no = +(Settings.get('prPart:'+id) || (mineFirst ? mineFirst.no : 1));
+    const p = parts.find(x=>x.no===no) || parts[0]; if(!p){ el.innerHTML = '<p>순서가 없습니다.</p>'; return; } no = p.no;
+    const kind = Practice.kind(p), key = `${id}#${no}`, pr = Store.get('practice', key) || {};
+    const bible = Store.get('bible', id);
+    let readTxt = '';
+    if(kind==='reading' && bible){ const r = extractScriptures(p.sub||'')[0]; const m = r && r.match(/(\d+):(\d+)(?:-(\d+))?$/);
+      if(m){ const ch = +m[1], v1 = +m[2], v2 = +(m[3]||m[2]); const chunk = bible.text.split(/\[[^\]]*?(\d+)장\]/);
+        const idx = chunk.findIndex((c,i)=>i%2===1 && +c===ch); const body = idx>0 ? chunk[idx+1] : '';
+        let first = true; const vs = body.split(/\n\s*(?=\d{1,3}\s)/).filter(l=>{ const mm = l.trim().match(/^(\d{1,3})\s/); if(!mm) return false; let n = +mm[1]; if(first){ first = false; if(n===ch) n = 1; } return n>=v1 && n<=v2; }).map(l=>l.trim().replace(new RegExp('^'+ch+'\\s'), '1 '));
+        readTxt = vs.join('\n').trim(); } }
+    el.innerHTML = `
+      <style>.timer{font:700 2.6rem/1 var(--body);font-variant-numeric:tabular-nums;color:var(--ok)} .timer.warn{color:var(--mark)} .timer.over{color:var(--bad)}
+        .scr{white-space:pre-line;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:1rem;line-height:1.85;max-height:420px;overflow:auto}
+        .rec{width:14px;height:14px;border-radius:50%;background:var(--bad);display:inline-block;animation:blink 1s infinite} @keyframes blink{50%{opacity:.2}}</style>
+      <section class="hero"><div class="kicker">${esc(w.label)} · ${Practice.label[kind]}</div><h1>${p.no}. ${esc(p.title)}</h1><p>${p.min}분 ${p.sub ? '· '+esc(p.sub) : ''}${p.who ? ' · 👤 '+esc(p.who) : ''}</p><div class="big">🎤</div></section>
+      ${weekBar(el, ids, id)}
+      <div class="card"><label style="margin-top:0">연습할 과제</label><select id="prSel">${parts.map(x=>`<option value="${x.no}" ${x.no===no?'selected':''}>${x.no}. ${esc(x.title)} (${x.min}분)${Weeks.isMine(x.who)?' — 내 과제':''}</option>`).join('')}</select>
+        ${p.detail ? `<details class="more"><summary>교재 내용</summary><div class="desc" style="white-space:pre-line;margin-top:8px">${esc(p.detail)}</div></details>` : ''}</div>
+      ${kind==='reading' ? `<div class="card"><h2>📜 낭독 본문</h2>${readTxt ? `<div class="scr">${esc(readTxt)}</div>` : `<p class="desc">${bible ? '본문에서 낭독 범위를 찾지 못했습니다.' : '성경범위 파일을 불러오면 낭독 본문이 여기에 나옵니다.'} (${esc(p.sub||'')})</p>`}</div>` : ''}
+      <div class="card"><h2>📝 ${kind==='demo' ? '실연 예시 대본' : kind==='reading' ? '낭독 연습 도움말' : kind==='life' ? '진행 메모' : '연설문'}</h2>
+        <p class="desc">이번 주 화면에서 이 순서를 자료 조사해 두었다면 체크한 자료가 함께 쓰입니다.</p>
+        <div class="row" style="margin-top:0"><button class="btn" id="prGo">✍️ 만들기</button><button class="btn danger" id="prStop" disabled>중지</button><button class="btn ghost" id="prCopy">복사</button></div><div class="st" id="prSt"></div>
+        <textarea id="prScript" style="min-height:240px;margin-top:10px" placeholder="만든 내용이 여기에 나옵니다. 직접 고칠 수 있습니다.">${esc(pr.script||'')}</textarea></div>
+      <div class="card"><h2>⏱️ 말하기 연습</h2>
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap"><div class="timer" id="prClock">0:00</div><span class="desc" style="margin:0">목표 ${p.min}분 · 30초 남으면 노랑, 넘으면 빨강</span></div>
+        <div class="row"><button class="btn" id="prStart">▶ 시작</button><button class="btn ghost" id="prReset">↺ 초기화</button><button class="btn ghost" id="prRec">🎙️ 녹음</button><button class="btn ghost" id="prDict" ${('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) ? '' : 'disabled title="이 브라우저는 받아쓰기를 지원하지 않습니다"'}>🗣️ 받아쓰기</button></div>
+        <div id="prRecBox" class="st"></div><audio id="prPlay" controls hidden style="width:100%;margin-top:8px"></audio>
+        <label>내 실연 (말한 내용)</label><textarea id="prMine" placeholder="받아쓰기를 누르고 말하거나, 휴대폰 키보드의 🎤로 말해 넣으세요.">${esc(pr.mine||'')}</textarea>
+        <div class="row"><button class="btn" id="prFb">🤖 피드백 받기</button></div><div class="st" id="prFbSt"></div>
+        ${pr.feedback ? `<div class="scr" style="margin-top:10px">${esc(pr.feedback)}</div>` : ''}</div>`;
+    bindWeekBar(el, ids, id);
+    const save = (patch) => Store.set('practice', key, {...(Store.get('practice', key)||{}), ...patch});
+    $('#prSel').onchange = e=>{ Settings.set('prPart:'+id, e.target.value); render(); };
+    const sc = $('#prScript'); let tm; sc.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>save({script:sc.value}), 400); };
+    const mine = $('#prMine'); let tm2; mine.oninput = ()=>{ clearTimeout(tm2); tm2 = setTimeout(()=>save({mine:mine.value}), 400); };
+    $('#prGo').onclick = async ()=>{ const st = $('#prSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+      prAbort = new AbortController(); $('#prGo').disabled = true; $('#prStop').disabled = false; st.className='st'; st.textContent='작성 중…';
+      try{ const mat = Research.materialText(`week:${id}#${no}`) + (readTxt ? `\n[낭독 본문]\n${readTxt}` : '');
+        const txt = await AI.write({system:Practice.rules, prompt:Practice.scriptPrompt(w, p, kind, mat), signal:prAbort.signal, maxTokens:6000, onText:x=>{ sc.value = x; }});
+        save({script:txt}); st.className='st ok'; st.textContent = `완료 — 약 ${txt.length.toLocaleString()}자 (≈${(txt.length/330).toFixed(1)}분)`; }
+      catch(e){ st.className='st err'; st.textContent = e.name==='AbortError' ? '중지했습니다.' : '오류: '+e.message; }
+      $('#prGo').disabled = false; $('#prStop').disabled = true; prAbort = null; };
+    $('#prStop').onclick = ()=>{ if(prAbort) prAbort.abort(); };
+    $('#prCopy').onclick = async ()=>{ try{ await navigator.clipboard.writeText(sc.value); toast('복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
+    /* 타이머 */
+    let secs = 0, t0 = 0, running = false; clearInterval(prTimer);
+    const clock = $('#prClock'), goal = p.min*60;
+    const show = () => { const s = secs + (running ? Math.floor((Date.now()-t0)/1000) : 0); clock.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; clock.className = 'timer' + (s>goal ? ' over' : s>goal-30 ? ' warn' : ''); return s; };
+    $('#prStart').onclick = ()=>{ if(running){ secs = show(); running = false; clearInterval(prTimer); $('#prStart').textContent = '▶ 계속'; } else { t0 = Date.now(); running = true; prTimer = setInterval(show, 250); $('#prStart').textContent = '❚❚ 멈춤'; } };
+    $('#prReset').onclick = ()=>{ running = false; clearInterval(prTimer); secs = 0; show(); $('#prStart').textContent = '▶ 시작'; };
+    /* 녹음 */
+    $('#prRec').onclick = async ()=>{ const box = $('#prRecBox');
+      if(prRec && prRec.state==='recording'){ prRec.stop(); return; }
+      try{ const stream = await navigator.mediaDevices.getUserMedia({audio:true}); prChunks = []; prRec = new MediaRecorder(stream);
+        prRec.ondataavailable = e=>prChunks.push(e.data);
+        prRec.onstop = ()=>{ stream.getTracks().forEach(x=>x.stop()); const blob = new Blob(prChunks, {type:prRec.mimeType||'audio/webm'}); const url = URL.createObjectURL(blob);
+          const a = $('#prPlay'); a.src = url; a.hidden = false; $('#prRec').textContent = '🎙️ 다시 녹음';
+          box.innerHTML = `녹음 완료 · <a href="${url}" download="${esc(w.label)}_${p.no}번_연습.${/mp4/.test(blob.type)?'m4a':'webm'}">녹음 파일 저장</a>`; };
+        prRec.start(); $('#prRec').textContent = '■ 녹음 멈춤'; box.innerHTML = '<span class="rec"></span> 녹음 중…'; if(!running) $('#prStart').click();
+      }catch(e){ box.className='st err'; box.textContent='마이크를 쓸 수 없습니다. 브라우저의 마이크 권한을 확인하세요.'; } };
+    /* 받아쓰기 (크롬·엣지·삼성 인터넷) */
+    let rec = null;
+    $('#prDict').onclick = ()=>{ const SR = window.SpeechRecognition || window.webkitSpeechRecognition; if(!SR) return;
+      if(rec){ rec.stop(); return; }
+      rec = new SR(); rec.lang = 'ko-KR'; rec.continuous = true; rec.interimResults = false;
+      rec.onresult = e=>{ for(let i=e.resultIndex;i<e.results.length;i++) if(e.results[i].isFinal){ mine.value += (mine.value && !/\s$/.test(mine.value) ? ' ' : '') + e.results[i][0].transcript; } mine.dispatchEvent(new Event('input')); };
+      rec.onend = ()=>{ rec = null; $('#prDict').textContent = '🗣️ 받아쓰기'; };
+      rec.start(); $('#prDict').textContent = '■ 받아쓰기 멈춤'; if(!running) $('#prStart').click(); };
+    /* 피드백 */
+    $('#prFb').onclick = async ()=>{ const st = $('#prFbSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+      if(!mine.value.trim()){ st.className='st err'; st.textContent='먼저 내 실연 내용을 넣어 주세요.'; return; }
+      $('#prFb').disabled = true; st.className='st'; st.textContent='피드백 만드는 중…';
+      try{ const s = show(); const txt = await AI.write({system:Practice.rules, prompt:Practice.feedbackPrompt(w, p, kind, sc.value, mine.value, s), maxTokens:3000});
+        save({feedback:txt, mine:mine.value}); render(); }
+      catch(e){ st.className='st err'; st.textContent='오류: '+e.message; $('#prFb').disabled = false; } };
   },
   public(el){
-    const lg = Store.get('meta','legacySpeechImport');
-    el.innerHTML = `<section class="hero"><div class="kicker">공개 강연</div><h1>공개 강연 연설문</h1><p>골자를 붙여넣으면 성구의 연구 노트·연구 자료 찾아보기·경험담·내 자료를 모아 시간에 맞는 연설문과 연단용 화면을 만듭니다.</p><div class="big">🎙️</div></section>`
-      + (lg ? `<div class="card"><h2>📦 가져온 연설문 도우미 기록 <span class="badge ok">보관됨</span></h2><p class="desc">${esc(lg.topic||'(주제 없음)')} · 소재목 ${lg.sections}개 — 4단계에서 이 화면으로 이어집니다.</p></div>` : '')
-      + planCard([
-        ['🧾','골자 자동 분류','소재목·요점·성구·시간으로 나누기','4단계'],
-        ['🔎','자료 조사','연구 노트·연구 자료 찾아보기·경험담·내 자료(D:\\JW)','3단계'],
-        ['✍️','연설문 작성','소재목별 시간 맞춤, 출처 밝히기','4단계'],
-        ['🖥️','연단용 화면','소재목별 타이머와 편집 모드','4단계']
-      ]);
+    let ids = Talks.ids();
+    const legacy = Store.get('legacySpeech','draft');
+    if(legacy && !Store.get('meta','legacySpeechMoved')){
+      const t0 = Talks.blank(); Object.assign(t0, {topic:legacy.topic||'', total:+legacy.total||30, notes:legacy.notes||'', sections:(legacy.sections||[]).map(s=>({title:s.title||'', minutes:+s.minutes||3, points:s.points||''}))});
+      if(!t0.sections.length) t0.sections = [{title:'', minutes:5, points:''}];
+      Talks.save(t0); Store.set('meta','legacySpeechMoved', {at:Date.now(), id:t0.id}); ids = Talks.ids(); Settings.set('talkSel', t0.id);
+    }
+    let id = Settings.get('talkSel'); if(!ids.includes(id)) id = ids[0];
+    if(!id){ const n = Talks.blank(); Talks.save(n); id = n.id; ids = [id]; }
+    Settings.set('talkSel', id);
+    const t = JSON.parse(JSON.stringify(Talks.get(id)));
+    const sum = t.sections.reduce((a,s)=>a+(+s.minutes||0),0);
+    const n = (t.speech||'').split(/\n##\s*사용한 자료/)[0].replace(/^##.*$/mg,'').length;
+    const open = k => (Settings.get('talkOpen',{})[k] ?? true) ? 'open' : '';
+    el.innerHTML = `
+      <style>
+        .tsec{border:1px solid var(--line);border-left:5px solid var(--accent);border-radius:12px;padding:12px 14px;margin-top:12px;background:var(--surface-2)}
+        .tsec .hd{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}.tsec .hd>div:first-child{flex:1;min-width:200px}
+        .tsec textarea{min-height:110px} details.step{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:14px;box-shadow:var(--shadow)}
+        details.step>summary{list-style:none;cursor:pointer;padding:16px 20px;font-weight:700;font-size:1.06rem;display:flex;gap:8px;align-items:center}
+        details.step>summary::after{content:'▾';margin-left:auto;color:var(--muted)} details.step:not([open])>summary::after{content:'▸'}
+        details.step>.in{padding:0 20px 18px} #spOut{min-height:280px;font-family:var(--display);font-size:1.05rem;line-height:2;background:var(--surface-2)}
+        .meter{height:8px;border-radius:99px;background:var(--line);overflow:hidden;margin-top:6px}.meter i{display:block;height:100%;background:var(--accent)}
+      </style>
+      <section class="hero"><div class="kicker">공개 강연</div><h1>${esc(t.topic||'새 연설')}</h1><p>${t.total}분 · 소재목 ${t.sections.length}개${n ? ` · 원고 약 ${n.toLocaleString()}자 (≈${(n/CPM).toFixed(1)}분)` : ''}</p><div class="big">🎙️</div></section>
+      <div class="wkbar" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+        <select id="tSel" style="flex:1;min-width:200px">${ids.map(x=>{ const o = Talks.get(x)||{}; return `<option value="${x}" ${x===id?'selected':''}>${esc(o.topic||'(제목 없음)')} · ${o.total||''}분</option>`; }).join('')}</select>
+        <button class="btn sm" id="tNew">＋ 새 연설</button><button class="btn sm danger" id="tDel">삭제</button>
+      </div>
+
+      <details class="step" data-s="paste" ${open('paste')}><summary>① 골자 붙여넣기</summary><div class="in">
+        <p class="desc">골자 전체를 붙여넣고 ‘자동 분류’를 누르면 주제·유의 사항·소재목·요점·시간이 채워집니다. (지금 입력된 소재목은 바뀝니다)</p>
+        <textarea id="olPaste" placeholder="제180번 부활 희망이…&#10;유의 사항: …&#10;부활이 필요하게 된 이유 (7분)&#10;…"></textarea>
+        <div class="row"><button class="btn" id="olGo">자동 분류</button></div><div class="st" id="olSt"></div></div></details>
+
+      <details class="step" data-s="basic" ${open('basic')}><summary>② 주제와 소재목 <span class="badge ${sum===+t.total?'ok':'soon'}">${sum}/${t.total}분</span></summary><div class="in">
+        <div class="grid c2" style="grid-template-columns:3fr 1fr"><div><label>강연 주제</label><input type="text" id="tTopic" value="${esc(t.topic)}"></div>
+          <div><label>총 시간</label><select id="tTotal">${[5,10,15,20,30,45].concat([+t.total]).filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b).map(v=>`<option value="${v}" ${v===+t.total?'selected':''}>${v}분</option>`).join('')}</select></div></div>
+        <label>유의 사항</label><textarea id="tNotes" style="min-height:70px">${esc(t.notes)}</textarea>
+        <div id="tSecs">${t.sections.map((s,i)=>`<div class="tsec" data-i="${i}"><div class="hd"><div><label>소재목 ${i+1}</label><input type="text" data-f="title" value="${esc(s.title)}"></div><div style="width:84px"><label>분</label><input type="text" data-f="minutes" inputmode="numeric" value="${s.minutes}"></div><button class="btn sm danger" data-del="${i}" title="이 소재목 지우기">✕</button></div>
+          <label>요점·성구</label><textarea data-f="points">${esc(s.points)}</textarea></div>`).join('')}</div>
+        <div class="row"><button class="btn ghost sm" id="sAdd">＋ 소재목 추가</button></div></div></details>
+
+      <details class="step" data-s="research" ${open('research')}><summary>③ 소재목별 자료 조사</summary><div class="in">
+        <p class="desc">소재목을 고르면 그 요점의 성구와 핵심어가 채워집니다. 체크한 자료만 그 소재목을 쓸 때 쓰입니다.</p>
+        <div class="row" style="margin-top:0"><select id="rSec" style="flex:1">${t.sections.map((s,i)=>{ const r = Store.get('research',`talk:${t.id}#${i}`); return `<option value="${i}">${i+1}. ${esc(s.title||'(제목 없음)')}${r ? ` — 선택 ${(r.items||[]).filter(x=>x.checked).length}개` : ''}</option>`; }).join('')}</select>
+          <button class="btn ghost sm" id="rAll">모든 소재목 한꺼번에 조사</button></div>
+        <div class="st" id="rAllSt"></div><div id="talkR"></div></div></details>
+
+      <details class="step" data-s="write" ${open('write')}><summary>④ 연설문 작성</summary><div class="in">
+        <p class="desc">소재목마다 시간에 맞춰 차례로 씁니다. 원고는 직접 고칠 수 있고 자동 저장됩니다. ${AI.mode() ? '' : '<b>먼저 설정에서 AI를 연결해 주세요.</b>'}</p>
+        <div class="row" style="margin-top:0"><button class="btn" id="wGo">✍️ 연설문 작성</button><button class="btn danger" id="wStop" disabled>중지</button>
+          <button class="btn ghost" id="wCopy">복사</button><button class="btn ghost" id="wTxt">.txt 저장</button></div>
+        <div class="meter"><i style="width:${Math.min(100, n/((+t.total||30)*CPM)*100)}%"></i></div>
+        <div class="st" id="wSt">${n ? `원고 약 ${n.toLocaleString()}자 · 예상 ${(n/CPM).toFixed(1)}분 / 목표 ${t.total}분` : ''}</div>
+        <textarea id="spOut" placeholder="작성된 연설문이 여기에 나타납니다.">${esc(t.speech||'')}</textarea>
+        ${t.used ? `<details class="more"><summary>사용한 자료</summary><div class="desc" style="white-space:pre-line;margin-top:8px">${esc(t.used)}</div></details>` : ''}</div></details>
+
+      <details class="step" data-s="podium" ${open('podium')}><summary>⑤ 연단용 화면</summary><div class="in">
+        <p class="desc">원고를 소재목별 타이머와 편집 모드가 있는 연단용 화면으로 엽니다. 파일로 저장하면 휴대폰·태블릿에서 인터넷 없이도 열 수 있습니다.</p>
+        <div class="row" style="margin-top:0"><button class="btn" id="pOpen">🖥️ 연단용 화면 열기</button><button class="btn ghost" id="pSave">연단용 파일(.html) 저장</button></div><div class="st" id="pSt"></div></div></details>`;
+
+    /* 펼침 상태 기억 */
+    $$('details.step', el).forEach(d=>d.addEventListener('toggle', ()=>{ const o = Settings.get('talkOpen',{}); o[d.dataset.s] = d.open; Settings.set('talkOpen', o); }));
+    let tm = null; const commit = (re=false) => { clearTimeout(tm); tm = setTimeout(()=>{ Talks.save(t); if(re) render(); }, 400); };
+    $('#tSel').onchange = e=>{ Settings.set('talkSel', e.target.value); render(); };
+    $('#tNew').onclick = ()=>{ const n2 = Talks.blank(); Talks.save(n2); Settings.set('talkSel', n2.id); render(); };
+    $('#tDel').onclick = e=>{ const b = e.currentTarget; if(!b.dataset.arm){ b.dataset.arm=1; b.textContent='한 번 더 누르면 삭제'; setTimeout(()=>{ delete b.dataset.arm; b.textContent='삭제'; },3000); return; }
+      Store.del('talks', t.id); t.sections.forEach((s,i)=>Store.del('research', `talk:${t.id}#${i}`)); Settings.set('talkSel', null); toast('연설을 삭제했습니다.'); render(); };
+    $('#olGo').onclick = ()=>{ const r = parseOutlineText($('#olPaste').value), st = $('#olSt');
+      if(r.error){ st.className='st err'; st.textContent = r.error; return; }
+      if(r.topic) t.topic = r.topic; if(r.notes) t.notes = r.notes; if(r.total) t.total = r.total; t.sections = r.sections;
+      Talks.save(t); toast(r.msg); render(); };
+    $('#tTopic').oninput = e=>{ t.topic = e.target.value; commit(); };
+    $('#tTotal').onchange = e=>{ t.total = +e.target.value; commit(true); };
+    $('#tNotes').oninput = e=>{ t.notes = e.target.value; commit(); };
+    $$('.tsec', el).forEach(box=>{ const s = t.sections[+box.dataset.i];
+      $$('[data-f]', box).forEach(inp=>inp.addEventListener('input', ()=>{ const f = inp.dataset.f; s[f] = f==='minutes' ? +inp.value.replace(/\D/g,'')||0 : inp.value; commit(); }));
+      $$('[data-f=minutes]', box).forEach(inp=>inp.addEventListener('change', ()=>commit(true))); });
+    $$('[data-del]', el).forEach(b=>b.onclick = ()=>{ t.sections.splice(+b.dataset.del, 1); if(!t.sections.length) t.sections.push({title:'', minutes:5, points:''}); Talks.save(t); render(); });
+    $('#sAdd').onclick = ()=>{ t.sections.push({title:'', minutes:3, points:''}); Talks.save(t); render(); };
+
+    /* 자료 조사 */
+    const mountR = () => { const i = +$('#rSec').value, s = t.sections[i] || {title:'', points:''};
+      Research.mount($('#talkR', el), `talk:${t.id}#${i}`, {refs:[...new Set(extractScriptures(s.points))], kws:keywordsOfText(s.title+' '+s.points, 6), title:`${t.topic} ${i+1}. ${s.title}`}); };
+    $('#rSec').onchange = mountR; mountR();
+    $('#rAll').onclick = async e=>{ const b = e.currentTarget, st = $('#rAllSt'); b.disabled = true;
+      const apiOn = !!(Settings.get('apiKey','')||'').trim();
+      const opts = Object.assign({verses:true, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {}));
+      for(let i=0;i<t.sections.length;i++){ const s = t.sections[i]; const refs = [...new Set(extractScriptures(s.points))], kws = keywordsOfText(s.title+' '+s.points, 6);
+        const {items} = await Research.run({refs, kws}, opts, m=>st.textContent = `소재목 ${i+1}/${t.sections.length} — ${m}`);
+        Store.set('research', `talk:${t.id}#${i}`, {refs, kws, items, at:Date.now(), title:`${t.topic} ${i+1}. ${s.title}`}); }
+      st.className='st ok'; st.textContent = '모든 소재목 조사를 마쳤습니다.'; b.disabled = false; render(); };
+
+    /* 작성 */
+    const out = $('#spOut');
+    out.oninput = ()=>{ t.speech = out.value; commit(); };
+    $('#wGo').onclick = async ()=>{
+      const st = $('#wSt'); st.className = 'st';
+      if(!AI.mode()){ st.className='st err'; st.textContent = '설정에서 AI를 먼저 연결해 주세요.'; return; }
+      if(!t.sections.some(s=>s.title||s.points)){ st.className='st err'; st.textContent = '소재목이 없습니다.'; return; }
+      talkAbort = new AbortController(); $('#wGo').disabled = true; $('#wStop').disabled = false;
+      let done = '', used = '', tail = '';
+      try{
+        for(let i=0;i<t.sections.length;i++){ const s = t.sections[i];
+          const head = `## 소재목 ${i+1}. ${s.title} (${s.minutes}분)\n\n`;
+          st.textContent = `소재목 ${i+1}/${t.sections.length} 작성 중…`;
+          const text = await AI.write({system:Talks.rules(true), prompt:Talks.sectionPrompt(t, i, tail), signal:talkAbort.signal, maxTokens:8000,
+            onText: x=>{ out.value = done + head + x.split('###자료###')[0]; const c = out.value.length; st.textContent = `소재목 ${i+1}/${t.sections.length} 작성 중… 누적 약 ${c.toLocaleString()}자 (≈${(c/CPM).toFixed(1)}분)`; }});
+          const [main, mat] = text.split('###자료###');
+          done += head + main.trim() + '\n\n'; tail = main.trim().slice(-300);
+          if(mat) used += `소재목 ${i+1}. ${s.title}\n${mat.trim()}\n\n`;
+          out.value = done; t.speech = done; t.used = used.trim(); Talks.save(t);
+        }
+        const c = done.replace(/^##.*$/mg,'').length; st.className='st ok'; st.textContent = `완료 — 본문 약 ${c.toLocaleString()}자, 예상 ${(c/CPM).toFixed(1)}분 (목표 ${t.total}분)`;
+      }catch(e){ st.className='st err'; st.textContent = e.name==='AbortError' ? '중지했습니다. 작성된 부분은 저장되었습니다.' : '오류: '+e.message; if(done){ t.speech = done; Talks.save(t); } }
+      $('#wGo').disabled = false; $('#wStop').disabled = true; talkAbort = null;
+    };
+    $('#wStop').onclick = ()=>{ if(talkAbort) talkAbort.abort(); };
+    $('#wCopy').onclick = async ()=>{ try{ await navigator.clipboard.writeText(out.value); toast('원고를 복사했습니다.'); }catch(e){ out.select(); toast('선택했습니다. 복사하세요.'); } };
+    const download = (name, text, type) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], {type})); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 3000); };
+    const fname = (t.topic||'연설문').replace(/[\\/:*?"<>|]/g,'').slice(0,60);
+    $('#wTxt').onclick = ()=>download(fname+'.txt', out.value, 'text/plain;charset=utf-8');
+    $('#pOpen').onclick = ()=>{ const h = Talks.podiumHTML(t); if(!h){ $('#pSt').className='st err'; $('#pSt').textContent='먼저 연설문을 작성하세요. (소재목 제목이 “## …” 형식이어야 합니다)'; return; }
+      const w2 = window.open(URL.createObjectURL(new Blob([h], {type:'text/html'})), '_blank'); if(!w2){ $('#pSt').className='st err'; $('#pSt').textContent='팝업이 막혔습니다. ‘연단용 파일 저장’을 쓰세요.'; } };
+    $('#pSave').onclick = ()=>{ const h = Talks.podiumHTML(t); if(!h){ $('#pSt').className='st err'; $('#pSt').textContent='먼저 연설문을 작성하세요.'; return; } download(fname+'_연단용.html', h, 'text/html;charset=utf-8'); $('#pSt').className='st ok'; $('#pSt').textContent='저장했습니다.'; };
   },
   research(el){
     el.innerHTML = `<section class="hero"><div class="kicker">공통 도구</div><h1>자료 조사</h1><p>성구와 핵심어로 성구 본문, 연구 노트·연구 자료 찾아보기, 내 자료(D:\\JW), jw.org 기사, 경험담을 한 번에 찾습니다. 각 화면에도 같은 조사 도구가 들어 있습니다.</p><div class="big">🔎</div></section>
@@ -1280,9 +1920,9 @@ function bindImport(el){
     setTimeout(render, 1500);
   };
   $('#impFiles', el).onclick = ()=>$('#impFile', el).click();
-  $('#impFile', el).onchange = async e=>{ const files = [...e.target.files]; e.target.value=''; const all = [];
-    for(const f of files){ all.push(...Weeks.parseWorkbook(await f.text(), f.name)); }
-    apply(all, `파일 ${files.length}개`); };
+  $('#impFile', el).onchange = async e=>{ const files = [...e.target.files]; e.target.value=''; const r = await importJWFiles(files);
+    if(r.wt || r.bible) toast(`연구 기사 ${r.wt}개, 성경 읽기 ${r.bible}개도 함께 저장했습니다.`);
+    if(r.weeks.length) apply(r.weeks, `파일 ${files.length}개`); else { st.className='st ok'; st.textContent = `연구 기사 ${r.wt}개, 성경 읽기 ${r.bible}개를 저장했습니다.`; } };
   $('#impPasteBtn', el).onclick = ()=>{ const b = $('#impPasteBox', el); b.hidden = !b.hidden; if(!b.hidden) $('#impPaste', el).focus(); };
   $('#impPasteGo', el).onclick = ()=>apply(Weeks.parseWorkbook($('#impPaste', el).value), '붙여넣은 글');
   $('#impOld', el).onclick = async ()=>{
