@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.2 (날짜 바로잡기)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.4 (jw.org 가져오기 보강)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1136,7 +1136,7 @@ let talkAbort = null;
    ========================================================= */
 const WT = {
   parse(raw){
-    const lines = String(raw).replace(/\ufeff/g,'').split(/\r?\n/).map(l=>l.replace(/\s+$/,''));
+    const lines = String(raw).replace(/\ufeff/g,'').split(/\r?\n/).map(l=>l.replace(/\s+$/,'').replace(/^\s*#{1,6}\s*/,'').replace(/\*\*/g,'').replace(/^\s*질문\s*(\d)/,'$1').replace(/^(\s*\d{1,2}(?:\s*[,-]\s*\d{1,2})?)\s*[.)．]\s*(?=\S)/,'$1. '));
     const a = {title:'', theme:'', song:'', summary:'', paras:[], review:[], src:'', ans:{}};
     let i = 0, head = '', cur = null, inReview = false, pre = [];
     const skip = l => /^답을 적는 칸$/.test(l.trim());
@@ -1157,8 +1157,9 @@ const WT = {
     /* 머리말: 날짜, 노래, 제목, 주제 성구, 요점 */
     pre = pre.filter(l=>!/^\d{4}년\s*\d{1,2}월/.test(l));
     const si = pre.findIndex(l=>/^노래\s*\d+/.test(l)); if(si>=0){ a.song = pre[si]; pre.splice(si,1); }
-    a.title = pre.shift() || '';
-    const ti = pre.findIndex(l=>/^“.+”—/.test(l) || /^".+"—/.test(l)); if(ti>=0){ a.theme = pre[ti]; pre.splice(ti,1); }
+    const ti = pre.findIndex(l=>/^[“"].+[”"]\s*—/.test(l));
+    if(ti>0){ a.theme = pre[ti]; a.title = pre[ti-1]; pre.splice(0, ti+1, ...pre.slice(ti+1, ti+1).concat([])); pre = pre.slice(0); }
+    else { a.title = pre.shift() || ''; const t2 = pre.findIndex(l=>/^[“"].+[”"]\s*—/.test(l)); if(t2>=0){ a.theme = pre[t2]; pre.splice(t2,1); } }
     const yi = pre.indexOf('요점'); if(yi>=0) a.summary = pre.slice(yi+1).join(' ');
     return a;
   },
@@ -1276,8 +1277,8 @@ const WOL = {
     const url = this.meetingsUrl(id), label = Weeks.labelOf(id);
     const want = [mwb ? '생활과 봉사 집회 교재' : '', wt ? '「파수대」 연구 기사' : ''].filter(Boolean).join('와 ');
     const prompt = `다음은 jw.org 온라인 라이브러리의 ${label} 집회 페이지입니다: ${url}
-이 페이지를 web_fetch로 열고, 거기 연결된 이 주의 ${want}를 찾아 web_fetch로 열어 본문을 그대로 옮겨 주십시오. 열린 페이지의 주가 ${label}이 아니면 페이지 안의 앞뒤 주 링크를 따라가 ${label} 주를 찾으십시오.
-요약하거나 고치지 말고, 화면의 글을 순서대로 옮기십시오. 그림 파일·광고·메뉴는 빼십시오.
+이 페이지를 web_fetch로 여십시오. 이 주의 ${want} 본문이 이 페이지에 들어 있으면 그것을 쓰고, 없으면 페이지에 연결된 링크를 web_fetch로 열어 본문을 그대로 옮겨 주십시오. 열린 페이지의 주가 ${label}이 아니면 페이지 안의 앞뒤 주 링크를 따라가 ${label} 주를 찾으십시오.
+요약하거나 고치지 말고, 화면의 글을 순서대로 옮기십시오. 그림 파일·메뉴는 빼고, 마크다운 기호(#, **, -)는 쓰지 말고 일반 글로 쓰십시오. 질문 줄은 반드시 "1. 질문"처럼 번호와 마침표로 시작하십시오.
 
 출력 형식 (이 표시줄을 그대로 쓰십시오):
 ${mwb ? `===집회교재===
@@ -1306,9 +1307,14 @@ ${mwb ? `===집회교재===
       if(j.stop_reason === 'max_tokens'){ messages.push({role:'assistant', content:j.content}); messages.push({role:'user', content:'끊긴 곳부터 이어서 계속 옮겨 주십시오.'}); continue; }
       break;
     }
-    const sec = name => { const m = text.split(new RegExp('^===' + name + '===\\s*$', 'm'))[1]; return m ? m.split(/^===[^=\n]+===\s*$/m)[0].trim() : ''; };
+    WOL.lastRaw = text;
+    /* 마크다운(##, **, - ) 표시를 걷어 내고, 표시줄(===…===)의 모양이 조금 달라도 찾는다 */
+    const md = s => String(s).replace(/\r/g,'').split('\n').map(l=>l.replace(/^\s*#{1,6}\s*/,'').replace(/^\s*>\s?/,'').replace(/\*\*|__/g,'').replace(/^\s*[-•]\s+(?=\S)/,'  ').replace(/^\s*\*\s+/,'  ').replace(/^(\d{1,2})\)\s/,'$1. ')).filter(l=>!/^\s*(-{3,}|={3,}|`{3,}.*)\s*$/.test(l)).join('\n');
+    const sec = name => { const m = text.split(new RegExp('^[\\s#*]*={2,}\\s*' + name + '\\s*={2,}[\\s*]*$', 'm'))[1]; return m ? md(m.split(/^[\s#*]*={2,}\s*[^=\n]+?\s*={2,}[\s*]*$/m)[0]).trim() : ''; };
     const err = sec('오류'); if(err && !sec('집회교재') && !sec('파수대')) throw new Error(err.slice(0,200));
-    return {mwbText:sec('집회교재'), wtText:sec('파수대'), src:sec('출처'), url};
+    let mwbText = sec('집회교재'), wtText = sec('파수대');
+    if(!mwbText && !wtText){ const all = md(text); if(mwb && /성경에 담긴 보물/.test(all)) mwbText = all; if(wt && /\n\s*1\.\s/.test(all)) wtText = all; }
+    return {mwbText, wtText, src:sec('출처'), url};
   },
   /* 가져와서 저장까지 */
   async importWeek(id, opts, onStatus){
@@ -1316,7 +1322,7 @@ ${mwb ? `===집회교재===
     const out = {mwb:false, wt:false};
     if(r.mwbText){ const ws = Weeks.parseWorkbook(r.mwbText, '', id); if(ws.length){ const w = ws[0]; w.id = id; w.label = Weeks.labelOf(id); w.src = w.src || (r.src.match(/https:\/\/wol\.jw\.org\S+/)||[r.url])[0]; Weeks.mergeInto(w); out.mwb = true; } }
     if(r.wtText){ const a = WT.parse(r.wtText); if(a.paras.length){ const old = Store.get('wt', id); if(old && old.ans) a.ans = old.ans; a.src = a.src || r.url; Store.set('wt', id, a); out.wt = true; } }
-    if(!out.mwb && !out.wt) throw new Error('가져온 글에서 교재나 기사를 찾지 못했습니다. 잠시 후 다시 해 보세요.');
+    if(!out.mwb && !out.wt){ const e = new Error('가져온 글에서 교재나 기사를 찾지 못했습니다. 아래 ‘받은 글 보기’를 열어 내용을 확인해 주세요.'); e.raw = WOL.lastRaw; throw e; }
     return out;
   }
 };
@@ -1522,7 +1528,7 @@ const Views = {
       const wb = $('[data-act=wtWol]', el);
       if(wb) wb.onclick = async ()=>{ const s2 = $('[data-act=wtWolSt]', el); wb.disabled = true; s2.className='st';
         try{ await WOL.importWeek(id || Weeks.thisId(), {mwb:false, wt:true}, m=>s2.textContent = m); Settings.set('weekSel', id || Weeks.thisId()); render(); }
-        catch(e){ s2.className='st err'; s2.textContent = e.message; wb.disabled = false; } };
+        catch(e){ s2.className='st err'; s2.textContent = e.message; showRaw(s2, e.raw); wb.disabled = false; } };
       const st = $('[data-act=wtSt]', el); if(!st) return;
       $('[data-act=wtFiles]', el).onclick = ()=>$('[data-act=wtFile]', el).click();
       $('[data-act=wtFile]', el).onchange = async e=>{ const r = await importJWFiles([...e.target.files]); e.target.value=''; r.weeks.forEach(w=>Weeks.mergeInto(w));
@@ -2030,6 +2036,14 @@ function bindImport(el){
 }
 
 
+function showRaw(st, raw){
+  if(!raw) return;
+  const d = document.createElement('details'); d.className = 'more';
+  d.innerHTML = `<summary>받은 글 보기 (${raw.length.toLocaleString()}자)</summary><textarea readonly style="min-height:200px;margin-top:8px;font-size:.82rem"></textarea><div class="row"><button class="btn sm ghost">받은 글 복사</button></div>`;
+  $('textarea', d).value = raw;
+  $('button', d).onclick = async ()=>{ try{ await navigator.clipboard.writeText(raw); toast('복사했습니다. 대화창에 붙여 주시면 원인을 찾아 드립니다.'); }catch(e){} };
+  st.after(d);
+}
 function bindWol(el){
   const go = $('#wolGo', el); if(!go) return;
   const st = $('#wolSt', el);
@@ -2040,7 +2054,7 @@ function bindWol(el){
     for(const id of ids){
       try{ const r = await WOL.importWeek(id, opts, m=>st.textContent = `${Weeks.labelOf(id)} — ${m}`);
         done.push(`${Weeks.labelOf(id)} (${[r.mwb?'교재':'', r.wt?'파수대':''].filter(Boolean).join('·')})`); }
-      catch(e){ st.className='st err'; st.textContent = `${Weeks.labelOf(id)}: ${e.message}`; if(ids.length===1){ go.disabled = false; $('#wolNext4', el).disabled = false; return; } }
+      catch(e){ st.className='st err'; st.textContent = `${Weeks.labelOf(id)}: ${e.message}`; showRaw(st, e.raw); if(ids.length===1){ go.disabled = false; $('#wolNext4', el).disabled = false; return; } }
     }
     if(done.length){ Settings.set('weekSel', ids[0]); toast('가져왔습니다: '+done.join(', ')); render(); }
     else { go.disabled = false; $('#wolNext4', el).disabled = false; }
@@ -2091,7 +2105,31 @@ Store.on(info=>{ if(info.remote && current==='week') render(); });
 /* 앱을 새로 열 때 지난 주가 선택되어 있으면 이번 주로 돌아오기 */
 if((Settings.get('weekSel')||'') < Weeks.thisId()) Settings.set('weekSel', Weeks.thisId());
 applyTheme(); render(); refreshPills(); AI.probe(); if(Sync.token()) Sync.now();
-if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) addEventListener('load', ()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
+/* 새 버전 확인: GitHub Pages는 파일을 최대 10분 캐시하므로, 서버의 index.html 버전을 직접 비교해 알려 준다 */
+if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
+  addEventListener('load', async ()=>{
+    try{ const reg = await navigator.serviceWorker.register('sw.js', {updateViaCache:'none'}); reg.update(); }catch(e){}
+    let reloaded = false; navigator.serviceWorker.addEventListener('controllerchange', ()=>{ if(!reloaded && sessionStorage.getItem('jh.upd')){ reloaded = true; sessionStorage.removeItem('jh.upd'); location.reload(); } });
+  });
+}
+async function checkUpdate(){
+  if(!/^https?:$/.test(location.protocol)) return;
+  try{
+    const html = await (await fetch('./index.html?v='+Date.now(), {cache:'no-store'})).text();
+    const v = (html.match(/version:'([^']+)'/)||[])[1];
+    if(v && v !== APP.version && !$('#updBar')){
+      const bar = document.createElement('div'); bar.id = 'updBar';
+      bar.style.cssText = 'position:fixed;left:50%;top:calc(12px + env(safe-area-inset-top));transform:translateX(-50%);z-index:60;background:var(--accent);color:var(--accent-ink);padding:10px 14px;border-radius:12px;box-shadow:var(--shadow);display:flex;gap:10px;align-items:center;font-weight:600;max-width:92vw';
+      bar.innerHTML = `새 버전 v${esc(v.split(' ')[0])}이 있습니다 <button class="btn sm" style="background:#fff;color:#245b78;border-color:#fff">지금 바꾸기</button>`;
+      bar.querySelector('button').onclick = async ()=>{ sessionStorage.setItem('jh.upd','1');
+        try{ const regs = await navigator.serviceWorker.getRegistrations(); await Promise.all(regs.map(r=>r.update())); const ks = await caches.keys(); await Promise.all(ks.map(k=>caches.delete(k))); }catch(e){}
+        location.replace(location.pathname + '?u=' + Date.now() + location.hash); };
+      document.body.appendChild(bar);
+    }
+  }catch(e){}
+}
+addEventListener('load', ()=>setTimeout(checkUpdate, 1500));
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') checkUpdate(); });
 </script>
 </body>
 </html>
