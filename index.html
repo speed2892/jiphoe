@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.5 (OpenRouter 연결 오류 수정)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.7 (자료 선택 수 바로 표시)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -414,40 +414,51 @@ const AI = (()=>{
     if(!r.ok){ const t = await r.text(); throw new Error(`API 오류 ${r.status} — ` + explain(r.status, t)); }
     return readSSE(r, onText, signal);
   }
+  let onResearchStatus=null, lastResearchModel='', freeCache=null;
+  /* 도구 호출을 지원하는 OpenRouter 무료 모델 목록 (긴 문맥 순) */
+  async function freeToolModels(){
+    if(freeCache) return freeCache;
+    const r=await fetch('https://openrouter.ai/api/v1/models'); if(!r.ok) throw new Error('models '+r.status);
+    const d=(await r.json()).data||[];
+    freeCache=d.filter(m=>{ const pr=m.pricing||{}; const isFree=/:free$/.test(m.id) || (+pr.prompt===0 && +pr.completion===0);
+        return isFree && m.id!=='openrouter/free' && (m.supported_parameters||[]).includes('tools'); })
+      .sort((a,b)=>(b.context_length||0)-(a.context_length||0)).map(m=>m.id);
+    return freeCache;
+  }
   /* jw.org 온라인 라이브러리 조사: OpenRouter의 서버측 web_fetch 사용 */
   async function research({prompt, maxTokens=12000, domains=['wol.jw.org','www.jw.org'], maxUses=10}={}){
     if(provider()==='openrouter'){
       const k=openRouterKey();
       if(!k) throw new Error('OpenRouter API 키가 없습니다. 설정에서 OpenRouter 키를 저장해 주세요.');
-      const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{
-        method:'POST',
-        headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-Title':'Jiphoe Helper'},
-        body:JSON.stringify({
-          model:openRouterModel(),
-          max_tokens:maxTokens,
-          messages:[{role:'user',content:prompt}],
-          tools:[{type:'openrouter:web_fetch',parameters:{
-            engine:'openrouter',
-            allowed_domains:domains,
-            max_uses:maxUses,
-            max_content_tokens:30000
-          }}]
-        })
-      });
-      if(!r.ok){
-        const t=await r.text(); let msg=t;
-        try{const j=JSON.parse(t);msg=j.error?.message||j.message||t;}catch(e){}
-        if(r.status===402) throw new Error('OpenRouter 잔액 또는 웹 가져오기 사용 조건을 확인해 주세요. 무료 모델 사용과 웹 자료 가져오기는 별도일 수 있습니다.');
-        if(/tool|function|unsupported/i.test(msg)) throw new Error('선택한 무료 모델이 웹 자료 가져오기 도구를 지원하지 않을 수 있습니다. 도구 호출을 지원하는 모델로 바꾸어 다시 시도해 주세요.');
-        throw new Error(`OpenRouter 조사 오류 ${r.status} — ${String(msg).slice(0,260)}`);
+      /* 웹 가져오기 도구는 '도구 호출'을 지원하는 모델만 쓸 수 있다.
+         openrouter/free 는 아무 무료 모델이나 고르므로, 도구를 지원하는 무료 모델을 직접 골라 차례로 시도한다. */
+      const chosen=openRouterModel();
+      const free=await freeToolModels().catch(()=>[]);
+      const cands=[...new Set([...(chosen && chosen!=='openrouter/free' ? [chosen] : []), ...free.slice(0,5)])];
+      if(!cands.length) cands.push(chosen||'openrouter/free');
+      const fails=[];
+      for(const m of cands){
+        onResearchStatus && onResearchStatus(`웹 조사 모델: ${m}`);
+        let r;
+        try{
+          r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',
+            headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-Title':'Jiphoe Helper'},
+            body:JSON.stringify({model:m, max_tokens:maxTokens, messages:[{role:'user',content:prompt}],
+              provider:{require_parameters:true},
+              tools:[{type:'openrouter:web_fetch',parameters:{engine:'openrouter',allowed_domains:domains,max_uses:maxUses,max_content_tokens:30000}}]})});
+        }catch(e){ fails.push(`${m}: 접속 실패`); continue; }
+        if(!r.ok){
+          const t=await r.text(); let msg=t; try{const j=JSON.parse(t);msg=j.error?.message||j.message||t;}catch(e){}
+          if(r.status===401) throw new Error('OpenRouter 키가 맞지 않습니다.');
+          if(r.status===402) throw new Error('OpenRouter 잔액이 필요합니다 — 웹 가져오기 도구는 무료 모델이어도 요금이 붙을 수 있습니다. 출판물 참조는 ‘📋 요청 글 복사’로 Claude 채팅에서 찾게 하세요.');
+          fails.push(`${m}: ${r.status===429 ? '사용량 초과(잠시 후)' : String(msg).slice(0,80)}`); continue;
+        }
+        const j=await r.json(); const msg=j.choices?.[0]?.message;
+        let out=msg?.content||''; if(Array.isArray(out)) out=out.map(x=>x.text||'').join('');
+        if(String(out).trim()){ lastResearchModel=m; return String(out); }
+        fails.push(`${m}: 빈 답변`);
       }
-      const j=await r.json();
-      const msg=j.choices?.[0]?.message;
-      let out=msg?.content||'';
-      if(Array.isArray(out)) out=out.map(x=>x.text||'').join('');
-      if(!out && msg?.tool_calls?.length) throw new Error('웹 자료를 가져왔지만 최종 답변을 받지 못했습니다. 다시 시도해 주세요.');
-      if(!out) throw new Error('OpenRouter가 조사 결과를 반환하지 않았습니다.');
-      return String(out);
+      throw new Error('무료 모델로 웹 조사를 하지 못했습니다 ('+fails.join(' / ')+'). 잠시 후 다시 하거나, ‘📋 요청 글 복사’로 Claude 채팅에서 찾게 하세요.');
     }
     const k=key();
     if(!k) throw new Error('Claude를 선택한 경우에는 Claude API 키가 필요합니다.');
@@ -477,7 +488,7 @@ const AI = (()=>{
     if(!r.ok){ const t = await r.text(); throw new Error(`오류 ${r.status} — ` + explain(r.status, t)); }
     return true;
   }
-  return {probe, mode, write, research, test, model, openRouterModel, provider, explain};
+  return {probe, mode, write, research, test, model, openRouterModel, provider, explain, freeToolModels, setResearchStatus:f=>{onResearchStatus=f;}, lastResearchModel:()=>lastResearchModel};
 })();
 
 /* =========================================================
@@ -996,6 +1007,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
 - link: 연 페이지 주소
 열지 못한 참조는 points를 "열지 못함"으로 쓰십시오. 페이지에 없는 내용은 지어내지 마십시오.
 설명 없이 JSON 배열 하나만 출력하십시오: [{"ref":"…","title":"…","points":"…","scriptures":"…","link":"…"}]`;
+    AI.setResearchStatus(m=>onStatus && onStatus(m+' — 1-2분 걸릴 수 있음'));
     const text = await AI.research({prompt, maxTokens:8000, domains:['wol.jw.org','www.jw.org'], maxUses:Math.min(pubs.length*2+3,12)});
     const a = text.indexOf('['), b = text.lastIndexOf(']'); let list = [];
     try{ list = JSON.parse(text.slice(a, b+1)); }catch(e){ throw new Error('출판물 참조 응답을 읽지 못했습니다.'); }
@@ -1021,6 +1033,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
 - xrefs: 상호 참조 성구
 페이지에 없는 내용은 쓰지 마십시오. 없으면 "없음"이라고 쓰십시오.
 설명 없이 JSON 배열 하나만 출력하십시오: [{"ref":"요한복음 1:2","verse":"…","notes":"…","guide":"…","xrefs":"…"}]`;
+    AI.setResearchStatus(m=>onStatus && onStatus(m+' — 1-2분 걸릴 수 있음'));
     const text = await AI.research({prompt, maxTokens:8000, domains:['wol.jw.org','www.jw.org'], maxUses:Math.min(urls.length+2,10)});
     const a = text.indexOf('['), b = text.lastIndexOf(']'); let list = [];
     try{ list = JSON.parse(text.slice(a, b+1)); }catch(e){ throw new Error('연구 노트 응답을 읽지 못했습니다.'); }
@@ -1100,11 +1113,11 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
     const saved = Store.get('research', key) || null;
     const st = {refs: saved ? saved.refs : refs, kws: saved ? saved.kws : kws, pubs: saved && saved.pubs ? saved.pubs : (pubs||[]), items: saved ? saved.items : []};
     const pubOn = pubs!==null || !!ctx;
-    const apiOn = !!(Settings.get('apiKey','')||'').trim();
+    const apiOn = !!(Settings.get('apiKey','')||'').trim() || (AI.provider()==='openrouter' && !!(Settings.get('openrouterKey','')||'').trim());
     const opts = Object.assign({verses:true, pubs:apiOn, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {})); if(!apiOn){ opts.pubs = false; opts.study = false; }
     const draw = () => {
       const groups = Object.keys(this.KIND).map(k=>{ const g = st.items.filter(i=>i.kind===k); if(!g.length) return '';
-        return `<div class="rgrp"><div class="rgh">${this.KIND[k][0]} ${this.KIND[k][1]} <span class="badge">${g.filter(i=>i.checked).length}/${g.length}</span></div>`
+        return `<div class="rgrp"><div class="rgh">${this.KIND[k][0]} ${this.KIND[k][1]} <span class="badge" data-cnt="${k}">${g.filter(i=>i.checked).length}/${g.length}</span> <button class="btn ghost sm" data-all="${k}" style="padding:2px 8px">모두 선택</button> <button class="btn ghost sm" data-none="${k}" style="padding:2px 8px">모두 해제</button></div>`
           + g.map(i=>`<label class="ritem"><input type="checkbox" data-id="${esc(i.id)}" ${i.checked?'checked':''}><div><b>${esc(i.title)}</b> <span class="badge">${esc(i.source)}</span>${i.link?` <a href="${esc(/^\//.test(i.link)?'https://wol.jw.org'+i.link:i.link)}" target="_blank" rel="noopener">원문 ↗</a>`:''}<div class="rtx">${esc(i.text)}</div></div></label>`).join('') + '</div>'; }).join('');
       box.innerHTML = `
         <div class="grid c2">
@@ -1113,14 +1126,22 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
         </div>
         ${pubOn ? `<label>출판물 참조 (; 로 구분 — 비워 두면 교재 페이지에서 찾음)</label><input type="text" data-k="pubs" value="${esc(st.pubs.join('; '))}" placeholder="예: 「파17.10」 23면 9-10항; 「예레」 29면">` : ''}
         <div class="rops">${[['verses','성구 본문'], ...(pubOn ? [['pubs','출판물 참조'+(apiOn?'':' (Claude API 키 필요)')]] : []), ['study','연구 노트'+(apiOn?'':' (Claude API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${(k==='study'||k==='pubs')&&!apiOn?'disabled':''}> ${t}</label>`).join('')}</div>
-        <div class="row" style="margin-top:6px"><button class="btn" data-act="run">🔎 조사하기</button>${st.items.length?`<span class="st" style="margin:0">${st.items.filter(i=>i.checked).length}개 선택됨 — 체크한 자료만 AI 작성에 쓰입니다.</span>`:''}</div>
+        <div class="row" style="margin-top:6px"><button class="btn" data-act="run">🔎 조사하기</button>${st.items.length?`<span class="st" style="margin:0" data-k="selcount">${st.items.filter(i=>i.checked).length}개 선택됨 — 체크한 자료만 AI 작성에 쓰입니다.</span>`:''}</div>
         <div class="st" data-k="status">${saved && saved.at ? '마지막 조사: '+fmtTime(saved.at) : ''}</div>
         ${groups}`;
       const save = () => Store.set('research', key, {refs:st.refs, kws:st.kws, pubs:st.pubs, items:st.items, at:(Store.get('research',key)||{}).at || Date.now(), title});
       $('[data-k=refs]', box).onchange = e=>{ st.refs = e.target.value.split(/[,;]/).map(x=>x.trim()).filter(Boolean); };
       $('[data-k=kws]', box).onchange = e=>{ st.kws = csv(e.target.value); };
       $$('[data-o]', box).forEach(c=>c.onchange = ()=>{ opts[c.dataset.o] = c.checked; Settings.set('researchOpts', {...opts}); });
-      $$('.ritem input', box).forEach(c=>c.onchange = ()=>{ const it = st.items.find(i=>i.id===c.dataset.id); if(it){ it.checked = c.checked; save(); } });
+      /* 체크하면 바로 저장하고, 위의 숫자(그룹별 n/전체, ‘n개 선택됨’)도 바로 고친다 */
+      const recount = () => {
+        Object.keys(this.KIND).forEach(k=>{ const b = $(`[data-cnt="${k}"]`, box); if(b){ const g = st.items.filter(i=>i.kind===k); b.textContent = `${g.filter(i=>i.checked).length}/${g.length}`; } });
+        const sc = $('[data-k=selcount]', box); if(sc) sc.textContent = `${st.items.filter(i=>i.checked).length}개 선택됨 — 체크한 자료만 AI 작성에 쓰입니다.`;
+      };
+      $$('.ritem input', box).forEach(c=>c.onchange = ()=>{ st.items.filter(i=>i.id===c.dataset.id).forEach(it=>it.checked = c.checked); save(); recount(); });
+      const setAll = (k, v) => { st.items.filter(i=>i.kind===k).forEach(i=>i.checked = v); $$('.ritem input', box).forEach(c=>{ const it = st.items.find(i=>i.id===c.dataset.id); if(it) c.checked = it.checked; }); save(); recount(); };
+      $$('[data-all]', box).forEach(b=>b.onclick = e=>{ e.preventDefault(); setAll(b.dataset.all, true); });
+      $$('[data-none]', box).forEach(b=>b.onclick = e=>{ e.preventDefault(); setAll(b.dataset.none, false); });
       $('[data-act=run]', box).onclick = async e=>{
         st.refs = $('[data-k=refs]', box).value.split(/[,;]/).map(x=>x.trim()).filter(Boolean).flatMap(r=>extractScriptures(r).length ? extractScriptures(r) : [r]);
         st.kws = csv($('[data-k=kws]', box).value);
