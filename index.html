@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.7 (회중 명단)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.8 (참조 자료 반영)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -808,7 +808,48 @@ function keywordsOfText(s, n=8){
   const cnt = {}; keywordsOf(s).filter(w=>!QWORDS.test(w) && !/(니까|습니다|십시오|세요|습|면서|었|았|일을|하게)$/.test(w)).forEach(w=>cnt[w]=(cnt[w]||0)+1);
   return Object.entries(cnt).sort((a,b)=>b[1]-a[1]).map(x=>x[0]).slice(0,n);
 }
+/* 출판물 참조: 「파17.10」 23-24면 11-12항, 「예레」 29면, 「랑제」 3과 요점 2 … */
+function extractPubRefs(text){
+  const out = [], re = /「([^」]{1,30})」\s*((?:\d+(?:-\d+)?\s*(?:면|과|장|항|단락|요점|부록\s*[가-힣A-Z]?)\s*,?\s*)*)/g; let m;
+  const t = String(text||''); while((m = re.exec(t))){ const r = (`「${m[1]}」 `+(m[2]||'').trim()).trim(); if(!out.includes(r)) out.push(r); }
+  return out;
+}
 const Research = {
+  /* 출판물 참조: 그 주 집회 교재 페이지(wol)에서 해당 순서의 「」 참조 링크를 따라가 요점을 정리 */
+  async pubRefs(pubs, ctx={}, onStatus){
+    const key = (Settings.get('apiKey','')||'').trim(); if(!key) throw new Error('출판물 참조를 가져오려면 설정에서 API 키를 넣어 주세요.');
+    const page = ctx.weekId ? WOL.meetingsUrl(ctx.weekId) : '';
+    if(!pubs.length && !page) return [];
+    onStatus && onStatus(`출판물 참조 조사 중… (${pubs.length ? pubs.length+'개' : '교재 페이지에서 찾는 중'}, 1-2분 걸릴 수 있음)`);
+    const prompt = `여호와의 증인 집회 과제를 준비하는 사람을 위해, 교재 순서에 달린 출판물 참조의 요점을 정리해 주십시오.
+${page ? `그 주의 집회 교재 페이지: ${page}\n이 페이지를 web_fetch로 열어 "${ctx.title||''}" 순서를 찾고, 그 순서 안의 「」 출판물 참조 링크(예: 「파17.10」 23면 9-10항)를 따라가 해당 면·항을 web_fetch로 여십시오.` : ''}
+${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순서에 달린 「」 참조 전부'}
+참조마다 다음을 적습니다.
+- ref: 참조 표기 그대로 (예: 「파17.10」 23면 9-10항)
+- title: 출판물·기사 제목
+- points: 그 면·항이 말하는 요점 3-5개를 자신의 말로 간추린 것 (원문을 길게 옮기지 말 것. 꼭 필요한 짧은 표현만 따옴표로)
+- scriptures: 그 항에서 인용·언급한 성구
+- link: 연 페이지 주소
+열지 못한 참조는 points를 "열지 못함"으로 쓰십시오. 페이지에 없는 내용은 지어내지 마십시오.
+설명 없이 JSON 배열 하나만 출력하십시오: [{"ref":"…","title":"…","points":"…","scriptures":"…","link":"…"}]`;
+    const tools = [{type:'web_fetch_20250910', name:'web_fetch', max_uses:Math.min(pubs.length*2+3, 12), allowed_domains:['wol.jw.org','www.jw.org']}];
+    const messages = [{role:'user', content:prompt}]; let text = '';
+    for(let turn=0; turn<5; turn++){
+      const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
+        headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+        body: JSON.stringify({model:AI.model(), max_tokens:8000, tools, messages})});
+      if(!r.ok) throw new Error('API 오류 '+r.status+': '+(await r.text()).slice(0,200));
+      const j = await r.json();
+      text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
+      if(j.stop_reason !== 'pause_turn') break;
+      messages.push({role:'assistant', content:j.content});
+    }
+    const a = text.indexOf('['), b = text.lastIndexOf(']'); let list = [];
+    try{ list = JSON.parse(text.slice(a, b+1)); }catch(e){ throw new Error('출판물 참조 응답을 읽지 못했습니다.'); }
+    return list.filter(x=>x && x.ref).map(x=>{ const ok = !/열지 못함/.test(String(x.points||''));
+      return {id:'pub-'+x.ref, kind:'pub', title:`${x.ref}${x.title ? ' — '+x.title : ''}`, source:'출판물 참조',
+        text:[`[요점] ${x.points||'-'}`, x.scriptures ? `[언급 성구] ${x.scriptures}` : ''].filter(Boolean).join('\n'), link:x.link||page, checked:ok}; });
+  },
   /* 연구 노트: Anthropic API의 web_fetch로 연구용 성경 장 페이지를 읽어 해당 절만 정리 */
   async studyNotes(refs, onStatus){
     const key = (Settings.get('apiKey','')||'').trim(); if(!key) throw new Error('연구 노트를 가져오려면 설정에서 API 키를 넣어 주세요.');
@@ -892,10 +933,11 @@ const Research = {
     });
   },
   /* 한 번에 조사: opts = {verses, study, library, articles, exp} */
-  async run({refs=[], kws=[], queries=[]}, opts, onStatus){
+  async run({refs=[], kws=[], queries=[], pubs=[], ctx=null}, opts, onStatus){
     const out = [], errs = [];
     const step = async (on, label, fn) => { if(!on) return; onStatus && onStatus(label+' 찾는 중…'); try{ out.push(...await fn()); }catch(e){ errs.push(label+': '+(e.message||e)); } };
     await step(opts.verses && refs.length, '성구 본문', ()=>this.verses(refs));
+    await step(opts.pubs && (pubs.length || (ctx && ctx.weekId)), '출판물 참조', ()=>this.pubRefs(pubs, ctx||{}, onStatus));
     await step(opts.study && refs.length, '연구 노트', ()=>this.studyNotes(refs, onStatus));
     await step(opts.library, '내 자료', async()=>this.library(refs, kws));
     await step(opts.articles && (kws.length || queries.length), 'jw.org 기사', ()=>this.articles(kws, queries));
@@ -906,16 +948,17 @@ const Research = {
   materialText(key){
     const r = Store.get('research', key); if(!r) return '';
     const pick = (r.items||[]).filter(i=>i.checked); if(!pick.length) return '';
-    const grp = {verse:'성구 본문', study:'연구 노트·연구 자료 찾아보기', lib:'내 자료(출판물) 발췌', article:'jw.org 자료', exp:'경험담·체험기(출판물 발췌)'};
+    const grp = {verse:'성구 본문', pub:'교재의 출판물 참조 요점', study:'연구 노트·연구 자료 찾아보기', lib:'내 자료(출판물) 발췌', article:'jw.org 자료', exp:'경험담·체험기(출판물 발췌)'};
     return Object.keys(grp).map(k=>{ const g = pick.filter(i=>i.kind===k); return g.length ? `\n[${grp[k]}]\n` + g.map((i,n)=>`${n+1}. ${i.title} (${i.source})\n${i.text}`).join('\n\n') : ''; }).join('');
   },
-  KIND: {verse:['📜','성구 본문'], study:['📘','연구 노트'], lib:['📚','내 자료'], article:['📰','jw.org'], exp:['🌱','경험담']},
+  KIND: {verse:['📜','성구 본문'], pub:['📕','출판물 참조'], study:['📘','연구 노트'], lib:['📚','내 자료'], article:['📰','jw.org'], exp:['🌱','경험담']},
   /* 조사 패널을 화면에 붙이기 */
-  mount(box, key, {refs=[], kws=[], title=''} = {}){
+  mount(box, key, {refs=[], kws=[], title='', pubs=null, ctx=null} = {}){
     const saved = Store.get('research', key) || null;
-    const st = {refs: saved ? saved.refs : refs, kws: saved ? saved.kws : kws, items: saved ? saved.items : []};
+    const st = {refs: saved ? saved.refs : refs, kws: saved ? saved.kws : kws, pubs: saved && saved.pubs ? saved.pubs : (pubs||[]), items: saved ? saved.items : []};
+    const pubOn = pubs!==null || !!ctx;
     const apiOn = !!(Settings.get('apiKey','')||'').trim();
-    const opts = Object.assign({verses:true, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {}));
+    const opts = Object.assign({verses:true, pubs:apiOn, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {})); if(!apiOn){ opts.pubs = false; opts.study = false; }
     const draw = () => {
       const groups = Object.keys(this.KIND).map(k=>{ const g = st.items.filter(i=>i.kind===k); if(!g.length) return '';
         return `<div class="rgrp"><div class="rgh">${this.KIND[k][0]} ${this.KIND[k][1]} <span class="badge">${g.filter(i=>i.checked).length}/${g.length}</span></div>`
@@ -925,11 +968,12 @@ const Research = {
           <div><label>성구 (쉼표로 구분)</label><input type="text" data-k="refs" value="${esc(st.refs.join(', '))}" placeholder="예: 요한복음 1:1, 고린도 전서 15:6"></div>
           <div><label>핵심어 (쉼표로 구분)</label><input type="text" data-k="kws" value="${esc(st.kws.join(', '))}" placeholder="예: 부활, 희망"></div>
         </div>
-        <div class="rops">${[['verses','성구 본문'],['study','연구 노트'+(apiOn?'':' (API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${k==='study'&&!apiOn?'disabled':''}> ${t}</label>`).join('')}</div>
+        ${pubOn ? `<label>출판물 참조 (; 로 구분 — 비워 두면 교재 페이지에서 찾음)</label><input type="text" data-k="pubs" value="${esc(st.pubs.join('; '))}" placeholder="예: 「파17.10」 23면 9-10항; 「예레」 29면">` : ''}
+        <div class="rops">${[['verses','성구 본문'], ...(pubOn ? [['pubs','출판물 참조'+(apiOn?'':' (API 키 필요)')]] : []), ['study','연구 노트'+(apiOn?'':' (API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${(k==='study'||k==='pubs')&&!apiOn?'disabled':''}> ${t}</label>`).join('')}</div>
         <div class="row" style="margin-top:6px"><button class="btn" data-act="run">🔎 조사하기</button>${st.items.length?`<span class="st" style="margin:0">${st.items.filter(i=>i.checked).length}개 선택됨 — 체크한 자료만 AI 작성에 쓰입니다.</span>`:''}</div>
         <div class="st" data-k="status">${saved && saved.at ? '마지막 조사: '+fmtTime(saved.at) : ''}</div>
         ${groups}`;
-      const save = () => Store.set('research', key, {refs:st.refs, kws:st.kws, items:st.items, at:(Store.get('research',key)||{}).at || Date.now(), title});
+      const save = () => Store.set('research', key, {refs:st.refs, kws:st.kws, pubs:st.pubs, items:st.items, at:(Store.get('research',key)||{}).at || Date.now(), title});
       $('[data-k=refs]', box).onchange = e=>{ st.refs = e.target.value.split(/[,;]/).map(x=>x.trim()).filter(Boolean); };
       $('[data-k=kws]', box).onchange = e=>{ st.kws = csv(e.target.value); };
       $$('[data-o]', box).forEach(c=>c.onchange = ()=>{ opts[c.dataset.o] = c.checked; Settings.set('researchOpts', {...opts}); });
@@ -937,9 +981,10 @@ const Research = {
       $('[data-act=run]', box).onclick = async e=>{
         st.refs = $('[data-k=refs]', box).value.split(/[,;]/).map(x=>x.trim()).filter(Boolean).flatMap(r=>extractScriptures(r).length ? extractScriptures(r) : [r]);
         st.kws = csv($('[data-k=kws]', box).value);
+        if($('[data-k=pubs]', box)) st.pubs = $('[data-k=pubs]', box).value.split(';').map(x=>x.trim()).filter(Boolean);
         const btn = e.currentTarget, stEl = $('[data-k=status]', box); btn.disabled = true; stEl.className = 'st';
-        const {items, errs} = await this.run({refs:st.refs, kws:st.kws}, opts, m=>stEl.textContent = m);
-        st.items = items; Store.set('research', key, {refs:st.refs, kws:st.kws, items, at:Date.now(), title});
+        const {items, errs} = await this.run({refs:st.refs, kws:st.kws, pubs:pubOn ? st.pubs : [], ctx:pubOn ? ctx : null}, opts, m=>stEl.textContent = m);
+        st.items = items; Store.set('research', key, {refs:st.refs, kws:st.kws, pubs:st.pubs, items, at:Date.now(), title});
         draw();
         const s2 = $('[data-k=status]', box);
         s2.className = 'st' + (errs.length ? ' err' : ' ok');
@@ -1293,7 +1338,7 @@ const Practice = {
   rules: `당신은 여호와의 증인 평일 집회 과제를 준비하도록 돕는 도우미입니다.
 1. 교재에 적힌 요점·성구·장면 설정을 그대로 따르고, 없는 요점을 만들지 않습니다.
 2. 성구 본문이 제공되지 않은 성구는 내용을 지어내지 말고 [성구 낭독: 책 장:절] 로 표시해 읽도록 안내합니다.
-3. 「랑제」「읽가」 같은 출판물의 과·요점은 제목만 언급하고, 그 내용을 지어내지 않습니다.
+3. 교재의 「」 출판물 참조는 조사 자료의 '출판물 참조 요점'이 있으면 그 요점을 연설에 녹여 쓰고 출처(예: 「파17.10」 23면)를 말로 밝힙니다. 요점이 제공되지 않은 참조는 제목만 언급하고 내용을 지어내지 않습니다.
 4. 제공된 조사 자료를 쓸 때는 출처를 말로 밝힙니다.
 5. 존댓말 구어체로, 실제로 말하기 쉽게 씁니다.`,
   scriptPrompt(w, p, kind, mat){
@@ -1301,7 +1346,7 @@ const Practice = {
     if(kind==='demo') return base + `\n# 요청\n${p.min}분 안에 할 수 있는 실연 예시 대본을 쓰십시오. 전도인(학생)과 집주인 두 사람의 대화로, 장면 설정을 그대로 따르고 교재가 가리킨 과·요점을 실연에서 보여 주도록 합니다. 대본 앞에 "이 실연의 목표" 2줄, 대본 뒤에 "연습할 때 기억할 점" 3개를 적으십시오. 대화 줄은 "전도인:" "집주인:"으로 시작하십시오.`;
     if(kind==='reading') return base + `\n# 요청\n이 성경 낭독을 연습하도록 도와주십시오. ① 낭독 범위에서 강조해 읽을 낱말·구절과 쉼표에서 쉬어 읽을 곳을 알려 주고 ② 읽기 어려운 낱말(지명·인명)의 읽는 법을 적고 ③ 교재가 가리킨 과의 이름만 언급하며 연습 방법 3가지를 적으십시오. 성구 본문이 제공되지 않았다면 본문을 지어내지 마십시오.`;
     if(kind==='life') return base + `\n# 요청\n이 순서를 맡은 사람이 쓸 진행 메모를 만드십시오: 도입 한두 문장, 교재 질문별로 청중에게 물을 질문과 기대 답 요지, 마무리 적용 한두 문장.`;
-    return base + `\n# 요청\n약 ${p.min*330}자(${p.min}분) 분량의 연설문을 쓰십시오. 교재 요점을 순서대로 다루고, 짧은 도입과 실제적인 적용·결론을 넣으십시오.`;
+    return base + `\n# 요청\n약 ${p.min*330}자(${p.min}분) 분량의 연설문을 쓰십시오. 교재 요점을 순서대로 다루고, 요점마다 교재가 단 성구(낭독 안내)와 출판물 참조 요점·연구 노트를 활용해 설명과 예를 덧붙이십시오. 짧은 도입과 실제적인 적용·결론을 넣고, 묵상해 볼 점이 있으면 결론에서 답하십시오.`;
   },
   feedbackPrompt(w, p, kind, script, mine, secs){
     return `# 과제: ${p.no}. ${p.title} (${p.min}분) · ${p.sub||''}\n# 교재 내용\n${p.detail||'-'}\n# 준비한 예시 대본·연설문\n${script||'(없음)'}\n# 내 실연(말한 내용을 받아 적은 것)\n${mine}\n# 걸린 시간\n${secs ? Math.floor(secs/60)+'분 '+(secs%60)+'초' : '측정 안 함'} / 목표 ${p.min}분\n\n# 요청\n따뜻하지만 정직하게 피드백을 주십시오. ① 잘한 점 2가지 ② 고치면 좋을 점 2가지(구체적인 바꿀 문장 예시 포함) ③ 시간 조절 조언 ④ 교재가 가리킨 과·요점을 실연에서 잘 보여 주었는지 — 과의 내용을 지어내지 말고 교재 문구만 근거로 판단하십시오.`;
@@ -1557,7 +1602,7 @@ const Views = {
       const src = [p.title, p.sub, p.detail].join('\n');
       let refs = extractScriptures(src); if(/영적 보물/.test(p.title||'') && !refs.length && w.reading) refs = [];
       const kws = keywordsOfText([p.title, p.detail].join(' '), 6);
-      Research.mount($('#weekR', el), `week:${w.id}#${no}`, {refs:[...new Set(refs)], kws, title:`${w.label} ${no}. ${p.title}`}); };
+      Research.mount($('#weekR', el), `week:${w.id}#${no}`, {refs:[...new Set(refs)], kws, title:`${w.label} ${no}. ${p.title}`, pubs:extractPubRefs(src), ctx:{weekId:w.id, title:p.title}}); };
     if($('#rTarget', el)){ const last = Settings.get('rTarget:'+w.id); if(last) $('#rTarget', el).value = last; $('#rTarget', el).onchange = ()=>{ Settings.set('rTarget:'+w.id, $('#rTarget', el).value); mountR(); }; mountR(); }
   },
   wt(el){
@@ -1686,6 +1731,11 @@ const Views = {
         const idx = chunk.findIndex((c,i)=>i%2===1 && +c===ch); const body = idx>0 ? chunk[idx+1] : '';
         let first = true; const vs = body.split(/\n\s*(?=\d{1,3}\s)/).filter(l=>{ const mm = l.trim().match(/^(\d{1,3})\s/); if(!mm) return false; let n = +mm[1]; if(first){ first = false; if(n===ch) n = 1; } return n>=v1 && n<=v2; }).map(l=>l.trim().replace(new RegExp('^'+ch+'\\s'), '1 '));
         readTxt = vs.join('\n').trim(); } }
+    const prSrc = [p.title, p.sub, p.detail].join('\n'), prRefs = [...new Set(extractScriptures(prSrc))], prPubs = extractPubRefs(prSrc);
+    const prSrcInfo = (prRefs.length || prPubs.length)
+      ? `<div class="desc" style="margin-top:8px">🔗 참조: ${[...prRefs, ...prPubs].map(esc).join(' · ')}</div>`
+      : `<div class="note" style="margin-top:8px">교재 내용에 성구·출판물 참조가 없습니다. 이번 주 화면에서 jw.org 교재를 <b>복사해 붙여넣기</b>로 다시 불러오면 「」 참조까지 들어옵니다. (그대로 두어도 조사할 때 교재 페이지에서 참조를 찾아봅니다)</div>`;
+    const prKey = `week:${id}#${no}`, prCtx = {weekId:id, title:p.title};
     el.innerHTML = `
       <style>.timer{font:700 2.6rem/1 var(--body);font-variant-numeric:tabular-nums;color:var(--ok)} .timer.warn{color:var(--mark)} .timer.over{color:var(--bad)}
         .scr{white-space:pre-line;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:1rem;line-height:1.85;max-height:420px;overflow:auto}
@@ -1693,7 +1743,9 @@ const Views = {
       <section class="hero"><div class="kicker">${esc(w.label)} · ${Practice.label[kind]}</div><h1>${p.no}. ${esc(p.title)}</h1><p>${p.min}분 ${p.sub ? '· '+esc(p.sub) : ''}${p.who ? ' · 👤 '+esc(p.who) : ''}</p><div class="big">🎤</div></section>
       ${weekBar(el, ids, id)}
       <div class="card"><label style="margin-top:0">연습할 과제</label><select id="prSel">${parts.map(x=>`<option value="${x.no}" ${x.no===no?'selected':''}>${x.no}. ${esc(x.title)} (${x.min}분)${Weeks.isMine(x.who)?' — 내 과제':''}</option>`).join('')}</select>
-        ${p.detail ? `<details class="more"><summary>교재 내용</summary><div class="desc" style="white-space:pre-line;margin-top:8px">${esc(p.detail)}</div></details>` : ''}</div>
+        ${p.detail ? `<details class="more" open><summary>교재 내용</summary><div class="desc" style="white-space:pre-line;margin-top:8px">${esc(p.detail)}</div></details>` : ''}
+        ${prSrcInfo}</div>
+      ${kind!=='reading' ? `<div class="card"><h2>📚 참조 자료</h2><p class="desc">교재에 달린 성구·「」 출판물 참조(예: 「파17.10」 23면 9-10항)를 찾아 요점을 정리합니다. 체크한 자료가 연설문에 반영됩니다. 조사하지 않고 만들기를 누르면 자동으로 먼저 찾습니다.</p><div id="prR"></div></div>` : ''}
       ${kind==='reading' ? `<div class="card"><h2>📜 낭독 본문</h2>${readTxt ? `<div class="scr">${esc(readTxt)}</div>` : `<p class="desc">${bible ? '본문에서 낭독 범위를 찾지 못했습니다.' : '성경범위 파일을 불러오면 낭독 본문이 여기에 나옵니다.'} (${esc(p.sub||'')})</p>`}</div>` : ''}
       <div class="card"><h2>📝 ${kind==='demo' ? '실연 예시 대본' : kind==='reading' ? '낭독 연습 도움말' : kind==='life' ? '진행 메모' : '연설문'}</h2>
         <p class="desc">이번 주 화면에서 이 순서를 자료 조사해 두었다면 체크한 자료가 함께 쓰입니다.</p>
@@ -1707,13 +1759,23 @@ const Views = {
         <div class="row"><button class="btn" id="prFb">🤖 피드백 받기</button></div><div class="st" id="prFbSt"></div>
         ${pr.feedback ? `<div class="scr" style="margin-top:10px">${esc(pr.feedback)}</div>` : ''}</div>`;
     bindWeekBar(el, ids, id);
+    if($('#prR')) Research.mount($('#prR'), prKey, {refs:prRefs, kws:keywordsOfText([p.title, p.detail].join(' '), 6), title:`${w.label} ${no}. ${p.title}`, pubs:prPubs, ctx:prCtx});
     const save = (patch) => Store.set('practice', key, {...(Store.get('practice', key)||{}), ...patch});
     $('#prSel').onchange = e=>{ Settings.set('prPart:'+id, e.target.value); render(); };
     const sc = $('#prScript'); let tm; sc.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>save({script:sc.value}), 400); };
     const mine = $('#prMine'); let tm2; mine.oninput = ()=>{ clearTimeout(tm2); tm2 = setTimeout(()=>save({mine:mine.value}), 400); };
     $('#prGo').onclick = async ()=>{ const st = $('#prSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
       prAbort = new AbortController(); $('#prGo').disabled = true; $('#prStop').disabled = false; st.className='st'; st.textContent='작성 중…';
-      try{ const mat = Research.materialText(`week:${id}#${no}`) + (readTxt ? `\n[낭독 본문]\n${readTxt}` : '');
+      try{
+        const apiOn = !!(Settings.get('apiKey','')||'').trim();
+        if(kind!=='reading' && !Store.get('research', prKey)){
+          const {items, errs} = await Research.run({refs:prRefs, kws:keywordsOfText([p.title, p.detail].join(' '), 6), pubs:prPubs, ctx:prCtx},
+            {verses:true, pubs:apiOn, study:apiOn, library:true, articles:false, exp:false}, m=>st.textContent = '참조 자료 먼저 찾는 중 — '+m);
+          Store.set('research', prKey, {refs:prRefs, kws:keywordsOfText([p.title, p.detail].join(' '), 6), pubs:prPubs, items, at:Date.now(), title:p.title});
+          if($('#prR')) Research.mount($('#prR'), prKey, {pubs:prPubs, ctx:prCtx});
+          st.textContent = `참조 자료 ${items.length}개를 찾았습니다${errs.length ? ' (일부 실패: '+errs.join(' / ')+')' : ''}. 작성 중…`;
+        }
+        const mat = Research.materialText(prKey) + (readTxt ? `\n[낭독 본문]\n${readTxt}` : '');
         const txt = await AI.write({system:Practice.rules, prompt:Practice.scriptPrompt(w, p, kind, mat), signal:prAbort.signal, maxTokens:6000, onText:x=>{ sc.value = x; }});
         save({script:txt}); st.className='st ok'; st.textContent = `완료 — 약 ${txt.length.toLocaleString()}자 (≈${(txt.length/330).toFixed(1)}분)`; }
       catch(e){ st.className='st err'; st.textContent = e.name==='AbortError' ? '중지했습니다.' : '오류: '+e.message; }
