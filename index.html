@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.6 (노래·시간 정리)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.7 (회중 명단)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -387,6 +387,47 @@ const SEC = {
   ministry:{name:'야외 봉사에 힘쓰십시오', color:'#b07a12', soft:'rgba(176,122,18,.11)'},
   life:{name:'그리스도인 생활', color:'#9b2c2c', soft:'rgba(155,44,44,.09)'}
 };
+/* =========================================================
+   5-2-1. 회중 명단 (members: 이름을 키로 { name, gender:'M'|'F'|'U', group, role, car })
+   명단 파일(format "gyeongju-dongbu-roster")을 가져오면 기존 이름과 비교해 없는 사람만 넣는다.
+   ========================================================= */
+const Members = {
+  ROLES: ['장로','봉사의 종','파이오니아','전도인'],
+  clean: n => String(n||'').replace(/\s+/g,'').trim(),
+  all(){ return Object.values(Store.all('members')).sort((a,b)=>a.name.localeCompare(b.name,'ko')); },
+  has(n){ return !!Store.get('members', this.clean(n)); },
+  add(m){ const name = this.clean(m.name); if(!name) return false;
+    Store.set('members', name, { name, gender:m.gender||'U', group:m.group||'', role:m.role||'전도인', car:!!m.car }); return true; },
+  remove(n){ Store.del('members', this.clean(n)); },
+  /* 임명표·기존 기록에 쓰인 이름 */
+  usedNames(){
+    const set = new Set(Weeks.usedNames());
+    for(const k in Store.all('legacyMeeting')){ const m = /^coach-(.+)$/.exec(k); if(m && /^[가-힣]{2,5}$/.test(m[1].trim())) set.add(m[1].trim()); }
+    return set;
+  },
+  /* 명단 비교: 반환 {added:[], existed:[], notInRoster:[]} — apply=false면 미리보기만 */
+  importRoster(json, apply=true){
+    const d = typeof json==='string' ? JSON.parse(json) : json;
+    const list = Array.isArray(d) ? d : (d && d.members) || [];
+    if(!list.length) throw new Error('명단(members)이 비어 있습니다');
+    const added = [], existed = [], seen = new Set();
+    for(const raw of list){
+      const m = typeof raw==='string' ? {name:raw} : raw; const name = this.clean(m && m.name);
+      if(!name || seen.has(name)) continue; seen.add(name);
+      if(this.has(name)) existed.push(name);
+      else { added.push(name); if(apply) this.add({...m, name}); }
+    }
+    if(apply && d && Array.isArray(d.couples)){
+      const cs = Store.get('meta','couples',[]) || [], key = c=>[c.a,c.b].sort().join('|'), have = new Set(cs.map(key));
+      d.couples.forEach(c=>{ if(c && c.a && c.b && !have.has(key(c))){ cs.push({a:this.clean(c.a), b:this.clean(c.b)}); have.add(key(c)); } });
+      Store.set('meta','couples',cs);
+    }
+    const used = this.usedNames(), notInRoster = [...used].filter(n=>!seen.has(n) && !this.has(n)).sort((a,b)=>a.localeCompare(b,'ko'));
+    return {added, existed, notInRoster};
+  },
+  spouse(n){ n = this.clean(n); const c = (Store.get('meta','couples',[])||[]).find(c=>c.a===n||c.b===n); return c ? (c.a===n?c.b:c.a) : ''; },
+  label(m){ return [m.group, m.role, m.gender==='M'?'형제':m.gender==='F'?'자매':''].filter(Boolean).join(' · '); }
+};
 const Weeks = {
   pad: n => String(n).padStart(2,'0'),
   ymd(d){ return `${d.getFullYear()}-${this.pad(d.getMonth()+1)}-${this.pad(d.getDate())}`; },
@@ -506,13 +547,15 @@ const Weeks = {
     const j = await r.json(); const D = this.fsVal((j.fields||{}).D) || [];
     return D;
   },
-  names(){
+  usedNames(){
     const set = new Set();
     for(const w of Object.values(Store.all('weeks'))){
       [w.chair, w.prayerOpen, w.prayerClose, ...(w.parts||[]).map(p=>p.who)].forEach(s=>String(s||'').split(/[\/,·]/).forEach(n=>{ n = n.trim(); if(n) set.add(n); }));
     }
     return [...set].sort((a,b)=>a.localeCompare(b,'ko'));
   },
+  /* 명단 + 임명표에 쓰인 이름 */
+  names(){ return [...new Set([...Members.all().map(m=>m.name), ...this.usedNames()])].sort((a,b)=>a.localeCompare(b,'ko')); },
   /* 예상 시각: 노래·기도 5분, 소개말 1분, 학생 과제 뒤 조언 1분, 중간 노래 4분, 맺음말 3분 */
   timeline(w, start){
     const [h,m] = String(start||'19:30').split(':').map(Number); let t = h*60+m;
@@ -1478,7 +1521,7 @@ const Views = {
       <div class="card"><h2>📋 이번 주 적용점 모아보기</h2><p class="desc">교재 순서마다 생활과 봉사에 적용할 점을 한두 문장씩 모아 줍니다.</p>
         <div class="row" style="margin-top:0"><button class="btn ghost" id="apGo">적용점 만들기</button></div><div class="st" id="apSt"></div>
         ${Store.get('weekApply', w.id) ? `<div class="note" style="white-space:pre-line">${esc(Store.get('weekApply', w.id))}</div>` : ''}</div>
-      <datalist id="nameList">${Weeks.names().map(n=>`<option value="${esc(n)}">`).join('')}</datalist>`;
+      <datalist id="nameList">${Weeks.names().map(n=>{ const m = Store.get('members', n); return `<option value="${esc(n)}">${m ? esc(Members.label(m)) : ''}</option>`; }).join('')}</datalist>`;
 
     /* 저장 */
     let tm = null; const commit = (re=false) => { clearTimeout(tm); tm = setTimeout(()=>{ Weeks.save(w); if(re) render(); }, 350); };
@@ -1922,6 +1965,19 @@ const Views = {
       </div>
 
       <div class="card">
+        <h2>👥 회중 명단</h2>
+        <p class="desc">명단 파일(.json)을 고르거나 글을 붙여 넣으면, 지금 있는 이름과 비교해 <b>없는 사람만</b> 넣습니다. 임명표에서 이름을 입력할 때 목록으로 나옵니다.</p>
+        <div class="row"><button class="btn" id="rosFileBtn">명단 파일 선택</button><button class="btn ghost" id="rosPasteBtn">붙여 넣은 글로 가져오기</button><input type="file" id="rosFile" accept=".json,application/json,text/plain" hidden></div>
+        <textarea id="rosPaste" rows="3" placeholder="명단 JSON 글을 여기에 붙여 넣기 (선택)" style="margin-top:8px"></textarea>
+        <div class="st" id="rosSt">지금 명단 ${Members.all().length}명</div>
+        <div id="rosReport"></div>
+        <div class="row" style="margin-top:8px"><input type="text" id="rosName" placeholder="이름 한 명 추가" style="max-width:150px"><input type="text" id="rosGroup" placeholder="집단 (예: 3집단)" style="max-width:130px">
+          <select id="rosRole" style="max-width:130px">${Members.ROLES.map(r=>`<option>${r}</option>`).join('')}</select>
+          <select id="rosGender" style="max-width:100px"><option value="M">형제</option><option value="F">자매</option></select><button class="btn ghost sm" id="rosAdd">추가</button></div>
+        <details style="margin-top:10px"><summary>명단 보기 (집단별)</summary><div id="rosList"></div></details>
+      </div>
+
+      <div class="card">
         <h2>🎨 화면</h2>
         <label>밝기</label>
         <div class="seg" id="themeSeg">${[['light','밝게'],['dark','어둡게'],['system','기기 설정 따르기']].map(([v,t])=>`<button data-v="${v}" class="${theme===v?'on':''}">${t}</button>`).join('')}</div>
@@ -2003,6 +2059,31 @@ const Views = {
     $('#libClear').onclick = async e=>{ const b = e.currentTarget; if(!b.dataset.arm){ b.dataset.arm=1; b.textContent='한 번 더 누르면 비웁니다'; setTimeout(()=>{ delete b.dataset.arm; b.textContent='내 자료 비우기'; },3000); return; }
       try{ await libTx('readwrite', x=>x.clear()); }catch(err){} await libLoad(); render(); toast('내 자료를 비웠습니다.'); };
     /* 나와 회중 */
+    /* 회중 명단 */
+    const rosList = () => {
+      const by = {}; Members.all().forEach(m=>{ (by[m.group||'집단 없음'] ||= []).push(m); });
+      const keys = Object.keys(by).sort((a,b)=>(parseInt(a)||99)-(parseInt(b)||99) || a.localeCompare(b,'ko'));
+      $('#rosList').innerHTML = keys.length ? keys.map(g=>`<div style="margin-top:8px"><b>${esc(g)}</b> <span class="desc">(${by[g].length}명)</span><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">${by[g].map(m=>`<span class="pill" title="${esc(Members.label(m))}">${esc(m.name)}${m.role!=='전도인'?` <small>${esc(m.role)}</small>`:''} <button class="btn ghost sm" data-rdel="${esc(m.name)}" style="padding:0 6px">×</button></span>`).join('')}</div></div>`).join('') : '<p class="desc">아직 명단이 없습니다.</p>';
+      $$('[data-rdel]', $('#rosList')).forEach(b=>b.onclick = ()=>{ Members.remove(b.dataset.rdel); rosList(); $('#rosSt').textContent = `지금 명단 ${Members.all().length}명`; });
+    };
+    rosList();
+    const rosRun = (text, from) => {
+      const st = $('#rosSt'); st.className = 'st';
+      try{
+        const r = Members.importRoster(text);
+        st.textContent = `${from}: 새로 넣음 ${r.added.length}명 · 이미 있음 ${r.existed.length}명 → 지금 명단 ${Members.all().length}명`;
+        $('#rosReport').innerHTML = (r.added.length ? `<div class="note"><b>새로 넣은 사람 (${r.added.length})</b><br>${r.added.map(esc).join(', ')}</div>` : '<div class="note">새로 넣을 사람이 없습니다. 모두 이미 있습니다.</div>')
+          + (r.notInRoster.length ? `<div class="note" style="margin-top:6px"><b>임명표에는 있지만 명단 파일에 없는 이름 (${r.notInRoster.length})</b><br>${r.notInRoster.map(esc).join(', ')}<br><span class="desc">오타이거나 다른 회중 사람일 수 있습니다. 필요하면 아래에서 한 명씩 추가하세요.</span></div>` : '');
+        rosList();
+      }catch(err){ st.className = 'st err'; st.textContent = `${from}: 읽지 못했습니다 (${err.message})`; }
+    };
+    $('#rosFileBtn').onclick = ()=>$('#rosFile').click();
+    $('#rosFile').onchange = async e=>{ const f = e.target.files[0]; if(f) rosRun(await f.text(), f.name); e.target.value=''; };
+    $('#rosPasteBtn').onclick = ()=>{ const t = $('#rosPaste').value.trim(); if(t) rosRun(t, '붙여 넣은 글'); else toast('명단 글을 먼저 붙여 넣으세요.'); };
+    $('#rosAdd').onclick = ()=>{ const n = Members.clean($('#rosName').value); if(!n) return;
+      if(Members.has(n)){ toast(`${n}님은 이미 명단에 있습니다.`); return; }
+      Members.add({name:n, group:$('#rosGroup').value.trim(), role:$('#rosRole').value, gender:$('#rosGender').value});
+      $('#rosName').value=''; rosList(); $('#rosSt').textContent = `지금 명단 ${Members.all().length}명`; toast(`${n}님을 추가했습니다.`); };
     $('#myName').onchange = ()=>{ s.set('myName', $('#myName').value.trim()); $('#meSt').textContent='저장했습니다.'; };
     /* 화면 */
     $$('#themeSeg button').forEach(b=>b.onclick = ()=>{ s.set('theme', b.dataset.v==='system' ? null : b.dataset.v); applyTheme(); render(); });
