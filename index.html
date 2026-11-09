@@ -171,7 +171,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.0 (6단계: 연설·실연 연습)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.6.1 (jw.org 가져오기·날짜 자동)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -414,14 +414,15 @@ const Weeks = {
       {no:8, sec:'life', title:'회중 성서 연구', min:30, sub:'', detail:'', who:''}]};
   },
   /* 집회 교재 글(jw.org에서 복사하거나 D:\JW의 “…_집회교재_….txt”) → 주 목록 */
-  parseWorkbook(text, fileName=''){
+  parseWorkbook(text, fileName='', fallbackId=null){
     const yearHint = (fileName.match(/^(\d{4})-\d{2}-\d{2}/)||[])[1];
     const lines = String(text).replace(/\ufeff/g,'').split(/\r?\n/).map(l=>l.replace(/\s+$/,''));
-    const HEAD = /^\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일?\s*[-–~]\s*(?:(\d{1,2})\s*월\s*)?(\d{1,2})\s*일\s*$/;
+    const HEAD = /^\s*(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일?\s*[-–~]\s*(?:(\d{1,2})\s*월\s*)?(\d{1,2})\s*일\s*$/;
     const blocks = []; let cur = null;
-    for(const l of lines){ if(HEAD.test(l)){ cur = {label:l.trim(), lines:[]}; blocks.push(cur); } else if(cur) cur.lines.push(l); }
+    for(const l of lines){ const hm = l.match(HEAD); if(hm){ cur = {label:l.trim().replace(/^\d{4}\s*년\s*/,''), year:hm[1]?+hm[1]:0, lines:[]}; blocks.push(cur); } else if(cur) cur.lines.push(l); }
+    if(!blocks.length && fallbackId && /성경에 담긴 보물|야외 봉사에 힘쓰십시오/.test(text)) blocks.push({label:this.labelOf(fallbackId), year:0, lines, forceId:fallbackId});
     return blocks.map(b=>{
-      const id = this.idFromLabel(b.label, yearHint ? +yearHint : 0);
+      const id = b.forceId || this.idFromLabel(b.label, b.year || (yearHint ? +yearHint : 0));
       const w = {id, label:b.label.replace(/\s+/g,' '), reading:'', songs:['','',''], chair:'', prayerOpen:'', prayerClose:'', note:'', parts:[], src:''};
       let sec = 'treasure', part = null, gotTime = false;
       const flush = () => { if(part){ part.detail = part.detail.replace(/\n{3,}/g,'\n\n').trim(); w.parts.push(part); part = null; } };
@@ -1255,6 +1256,67 @@ const Practice = {
 };
 let prAbort = null, prRec = null, prChunks = [], prTimer = null;
 
+
+/* =========================================================
+   5-7. jw.org 온라인 라이브러리(WOL)에서 주간 자료 가져오기
+   브라우저는 wol.jw.org를 직접 읽을 수 없어서, Claude API의 web_fetch로 그 주의 ‘집회’ 페이지를 열고
+   생활과 봉사 집회 교재·파수대 연구 기사를 D:\JW 파일과 같은 글 형식으로 받아 온다.
+   ========================================================= */
+const WOL = {
+  isoWeek(d){ const x = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())); const day = x.getUTCDay() || 7; x.setUTCDate(x.getUTCDate() + 4 - day);
+    const y0 = new Date(Date.UTC(x.getUTCFullYear(), 0, 1)); return {y:x.getUTCFullYear(), w:Math.ceil(((x - y0)/86400000 + 1)/7)}; },
+  meetingsUrl(id){ const {y, w} = this.isoWeek(new Date(id+'T00:00:00')); return `https://wol.jw.org/ko/wol/meetings/r8/lp-ko/${y}/${w}`; },
+  async fetchWeek(id, {mwb=true, wt=true} = {}, onStatus){
+    const key = (Settings.get('apiKey','')||'').trim();
+    if(!key) throw new Error('jw.org에서 가져오려면 설정에서 Anthropic API 키를 넣어 주세요.');
+    const url = this.meetingsUrl(id), label = Weeks.labelOf(id);
+    const want = [mwb ? '생활과 봉사 집회 교재' : '', wt ? '「파수대」 연구 기사' : ''].filter(Boolean).join('와 ');
+    const prompt = `다음은 jw.org 온라인 라이브러리의 ${label} 집회 페이지입니다: ${url}
+이 페이지를 web_fetch로 열고, 거기 연결된 이 주의 ${want}를 찾아 web_fetch로 열어 본문을 그대로 옮겨 주십시오. 열린 페이지의 주가 ${label}이 아니면 페이지 안의 앞뒤 주 링크를 따라가 ${label} 주를 찾으십시오.
+요약하거나 고치지 말고, 화면의 글을 순서대로 옮기십시오. 그림 파일·광고·메뉴는 빼십시오.
+
+출력 형식 (이 표시줄을 그대로 쓰십시오):
+${mwb ? `===집회교재===
+첫 줄: ${label}
+둘째 줄: 성경 읽기 범위 (예: 예레미야 51-52장)
+그다음: "노래 N 및 기도 | 소개말 (1분)", 구역 제목(성경에 담긴 보물 / 야외 봉사에 힘쓰십시오 / 그리스도인 생활), 순서마다 "번호. 제목" 줄과 그 아래 "(N분) 부제…" 줄, 이어서 교재 본문, 중간 노래 "노래 N", 마지막 "맺음말 (3분) | 노래 N 및 기도"
+` : ''}${wt ? `===파수대===
+첫 줄: 연구 주간 (예: 2026년 11월 9-15일), 시작 노래, 기사 제목, 주제 성구, "요점"과 요점 문장
+그다음 질문마다: "번호. 질문" 한 줄, 이어서 그 항 본문 (본문 첫머리에 항 번호), 소제목은 한 줄로, 삽화 설명은 "(N항 참조)"로 끝나는 한 줄
+끝에: "어떻게 대답하시겠습니까?"와 복습 질문, 마치는 노래
+` : ''}===출처===
+연 페이지 주소들
+
+페이지를 열 수 없으면 ===오류=== 아래에 이유를 쓰십시오.`;
+    const tools = [{type:'web_fetch_20250910', name:'web_fetch', max_uses:5, allowed_domains:['wol.jw.org']}];
+    const messages = [{role:'user', content:prompt}]; let text = '';
+    for(let turn=0; turn<5; turn++){
+      onStatus && onStatus(turn ? `jw.org에서 이어서 가져오는 중… (${turn+1})` : 'jw.org 온라인 라이브러리에서 가져오는 중… (1-2분)');
+      const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
+        headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+        body: JSON.stringify({model:AI.model(), max_tokens:32000, tools, messages})});
+      if(!r.ok) throw new Error('API 오류 '+r.status+': '+(await r.text()).slice(0,200));
+      const j = await r.json();
+      text += (j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
+      if(j.stop_reason === 'pause_turn'){ messages.push({role:'assistant', content:j.content}); continue; }
+      if(j.stop_reason === 'max_tokens'){ messages.push({role:'assistant', content:j.content}); messages.push({role:'user', content:'끊긴 곳부터 이어서 계속 옮겨 주십시오.'}); continue; }
+      break;
+    }
+    const sec = name => { const m = text.split(new RegExp('^===' + name + '===\\s*$', 'm'))[1]; return m ? m.split(/^===[^=\n]+===\s*$/m)[0].trim() : ''; };
+    const err = sec('오류'); if(err && !sec('집회교재') && !sec('파수대')) throw new Error(err.slice(0,200));
+    return {mwbText:sec('집회교재'), wtText:sec('파수대'), src:sec('출처'), url};
+  },
+  /* 가져와서 저장까지 */
+  async importWeek(id, opts, onStatus){
+    const r = await this.fetchWeek(id, opts, onStatus);
+    const out = {mwb:false, wt:false};
+    if(r.mwbText){ const ws = Weeks.parseWorkbook(r.mwbText, '', id); if(ws.length){ const w = ws[0]; w.id = id; w.label = Weeks.labelOf(id); w.src = w.src || (r.src.match(/https:\/\/wol\.jw\.org\S+/)||[r.url])[0]; Weeks.mergeInto(w); out.mwb = true; } }
+    if(r.wtText){ const a = WT.parse(r.wtText); if(a.paras.length){ const old = Store.get('wt', id); if(old && old.ans) a.ans = old.ans; a.src = a.src || r.url; Store.set('wt', id, a); out.wt = true; } }
+    if(!out.mwb && !out.wt) throw new Error('가져온 글에서 교재나 기사를 찾지 못했습니다. 잠시 후 다시 해 보세요.');
+    return out;
+  }
+};
+
 /* =========================================================
    6. 화면 (뷰)
    ========================================================= */
@@ -1289,6 +1351,14 @@ const Views = {
           <li><span class="ic">${ai?'✅':'1️⃣'}</span><div><b>AI 연결</b><span>설정에서 Anthropic API 키를 저장합니다.</span></div></li>
           <li><span class="ic">${sync.state!=='off'?'✅':'2️⃣'}</span><div><b>기기 간 동기화</b><span>GitHub 토큰을 넣으면 폰·태블릿·PC가 같은 내용을 봅니다.</span></div></li>
         </ul><div class="row"><a class="btn sm" href="#settings">설정 열기</a></div></details>` : '';
+    const wolTarget = Settings.get('weekSel') && !Weeks.get(Settings.get('weekSel')) ? Settings.get('weekSel') : Weeks.thisId();
+    const wolCard = `<div class="card"><h2>🌐 jw.org에서 가져오기</h2>
+        <p class="desc">날짜를 고르면 jw.org 온라인 라이브러리에서 그 주의 생활과 봉사 집회 교재와 파수대 연구 기사를 가져옵니다. 날짜는 자동으로 맞춰지고, 이미 적은 이름 배정과 답변은 그대로 남습니다. (Claude API 키 필요 · 한 주에 1-2분)</p>
+        <div class="row" style="margin-top:0"><input type="date" id="wolDate" value="${wolTarget}" style="max-width:190px">
+          <label style="display:inline-flex;gap:6px;align-items:center;margin:0;font-weight:500"><input type="checkbox" id="wolMwb" checked> 집회 교재</label>
+          <label style="display:inline-flex;gap:6px;align-items:center;margin:0;font-weight:500"><input type="checkbox" id="wolWt" checked> 파수대</label>
+          <button class="btn" id="wolGo">가져오기</button><button class="btn ghost sm" id="wolNext4">앞으로 4주 한꺼번에</button></div>
+        <div class="st" id="wolSt"></div></div>`;
     const importCard = `<div class="card" id="impCard"><h2>📥 집회 교재 불러오기</h2>
         <p class="desc">D:\\JW의 txt 파일(집회교재·성경범위·연구 기사)을 여러 개 한꺼번에 고르거나, jw.org의 ‘생활과 봉사 집회 교재’ 글을 복사해 붙여넣으세요. 이미 있는 주는 교재 내용만 바뀌고 이름 배정은 그대로 남습니다.</p>
         <div class="row" style="margin-top:0"><button class="btn" id="impFiles">교재 파일 고르기 (.txt)</button><input type="file" id="impFile" accept=".txt,text/plain" multiple hidden>
@@ -1296,9 +1366,9 @@ const Views = {
         <div id="impPasteBox" hidden><textarea id="impPaste" placeholder="11월 9-15일&#10;예레미야 51-52장&#10;노래 98 및 기도 | 소개말 (1분)&#10;…"></textarea><div class="row"><button class="btn sm" id="impPasteGo">이 글로 만들기</button></div></div>
         <div class="st" id="impSt"></div></div>`;
     if(!id){
-      el.innerHTML = `<section class="hero"><div class="kicker">주간 집회 준비</div><h1>이번 주</h1><p>집회 교재를 불러오면 주마다 집회 순서와 이름 배정, 순서지 인쇄를 한곳에서 할 수 있습니다.</p><div class="big">🗓️</div></section>${setup}${importCard}
+      el.innerHTML = `<section class="hero"><div class="kicker">주간 집회 준비</div><h1>이번 주</h1><p>집회 교재를 불러오면 주마다 집회 순서와 이름 배정, 순서지 인쇄를 한곳에서 할 수 있습니다.</p><div class="big">🗓️</div></section>${setup}${wolCard}${importCard}
         <div class="card"><h2>➕ 빈 주 만들기</h2><p class="desc">교재 없이 이번 주를 직접 입력합니다.</p><div class="row" style="margin-top:0"><button class="btn ghost" id="addThis">이번 주 만들기</button></div></div>`;
-      bindImport(el); $('#addThis').onclick = ()=>{ const w = Weeks.blank(Weeks.thisId()); Weeks.save(w); Settings.set('weekSel', w.id); render(); };
+      bindImport(el); bindWol(el); $('#addThis').onclick = ()=>{ const w = Weeks.blank(Weeks.thisId()); Weeks.save(w); Settings.set('weekSel', w.id); render(); };
       return;
     }
     const w = JSON.parse(JSON.stringify(Weeks.get(id)));
@@ -1373,8 +1443,9 @@ const Views = {
         ${editing ? `<div class="row"><button class="btn sm ghost" id="pAdd">+ 순서 추가</button><button class="btn sm danger" id="wDel">이 주 삭제</button></div>` : ''}
         ${w.src ? `<p class="desc" style="margin-top:10px">출처: <a href="${esc(w.src)}" target="_blank" rel="noopener">jw.org 온라인 라이브러리</a></p>` : ''}
       </div>
+      ${wolCard}
       ${importCard}
-      <div class="card"><h2>➕ 주 추가</h2><p class="desc">교재 없이 빈 주를 만듭니다.</p><div class="row" style="margin-top:0"><input type="text" id="newWeek" placeholder="예: 2026-11-23" style="max-width:200px"><button class="btn ghost sm" id="addWeek">만들기</button></div></div>
+      <div class="card"><h2>➕ 주 추가</h2><p class="desc">교재 없이 빈 주를 만듭니다.</p><div class="row" style="margin-top:0"><input type="date" id="newWeek" style="max-width:200px"><button class="btn ghost sm" id="addWeek">만들기</button></div></div>
       <div class="card"><h2>🔎 이번 주 자료 조사</h2><p class="desc">순서를 고르면 그 순서의 성구와 핵심어가 자동으로 채워집니다. 조사한 자료는 순서별로 저장되어 해설·연설 작성에 쓰입니다.</p>
         <label>조사할 순서</label><select id="rTarget">${w.parts.map(p=>`<option value="${p.no}">${p.no}. ${esc(p.title)}</option>`).join('')}</select>
         <div id="weekR" style="margin-top:6px"></div></div>
@@ -1403,9 +1474,9 @@ const Views = {
     if($('#wDel')) $('#wDel').onclick = e=>{ const b = e.currentTarget; if(!b.dataset.arm){ b.dataset.arm = 1; b.textContent = '한 번 더 누르면 삭제'; setTimeout(()=>{ delete b.dataset.arm; b.textContent='이 주 삭제'; }, 3000); return; }
       Store.del('weeks', w.id); delete el.dataset.edit; Settings.set('weekSel', null); toast(`${w.label}을 삭제했습니다.`); render(); };
     $('#addWeek').onclick = ()=>{ const v = $('#newWeek').value.trim(); const d = /^\d{4}-\d{1,2}-\d{1,2}$/.test(v) ? new Date(v.replace(/-(\d)(?!\d)/g,'-0$1')+'T00:00:00') : null;
-      if(!d || isNaN(d)){ toast('날짜를 2026-11-23 형식으로 넣어 주세요.'); return; }
+      if(!d || isNaN(d)){ toast('날짜를 골라 주세요.'); return; }
       const nid = Weeks.ymd(Weeks.monday(d)); if(!Weeks.get(nid)) Weeks.save(Weeks.blank(nid)); go(nid); };
-    bindImport(el);
+    bindImport(el); bindWol(el);
     $('#apGo').onclick = async ()=>{ const st = $('#apSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
       st.className='st'; st.textContent='만드는 중…'; $('#apGo').disabled = true;
       try{ const txt = await AI.write({system:'당신은 여호와의 증인 평일 집회 교재에서 실제적인 적용점을 뽑아 주는 도우미입니다. 교재에 없는 내용을 지어내지 않습니다.',
@@ -1424,14 +1495,20 @@ const Views = {
     const ids = [...new Set([...Weeks.ids(), ...Object.keys(Store.all('wt'))])].sort();
     const id = pickWeek(ids);
     const a = id ? Store.get('wt', id) : null;
+    const wolBtn = `<div class="card"><h2>🌐 jw.org에서 이 주 파수대 가져오기</h2><p class="desc">jw.org 온라인 라이브러리에서 ${esc(Weeks.labelOf(id||Weeks.thisId()))} 연구 기사를 가져옵니다. (Claude API 키 필요)</p>
+      <div class="row" style="margin-top:0"><button class="btn" data-act="wtWol">가져오기</button></div><div class="st" data-act="wtWolSt"></div></div>`;
     const imp = `<div class="card"><h2>📥 연구 기사 불러오기</h2><p class="desc">D:\\JW의 “2026-11-09_기사 제목.txt” 같은 연구 기사 파일을 고르세요. 집회교재·성경범위 파일을 함께 골라도 알아서 나눠 저장합니다. 또는 기사 본문 전체를 붙여넣으세요.</p>
       <div class="row" style="margin-top:0"><button class="btn" data-act="wtFiles">파일 고르기 (.txt)</button><input type="file" data-act="wtFile" accept=".txt,text/plain" multiple hidden><button class="btn ghost" data-act="wtPasteBtn">본문 붙여넣기</button></div>
       <div data-act="wtPasteBox" hidden><textarea data-act="wtPaste" placeholder="2026년 11월 9-15일&#10;노래 36 …&#10;기사 제목&#10;…"></textarea><div class="row"><button class="btn sm" data-act="wtPasteGo">이 주에 넣기</button></div></div>
       <div class="st" data-act="wtSt"></div></div>`;
     const head = `<section class="hero"><div class="kicker">${id ? esc(Weeks.labelOf(id))+' · ' : ''}파수대 연구</div><h1>${a ? esc(a.title) : '파수대 연구'}</h1><p>${a ? esc(a.theme) : '연구 기사를 불러오면 질문마다 해설 답변을 준비할 수 있습니다.'}</p><div class="big">📖</div></section>`;
-    el.innerHTML = head + (ids.length ? weekBar(el, ids, id) : '') + (a ? '' : imp);
+    el.innerHTML = head + (ids.length ? weekBar(el, ids, id) : '') + (a ? '' : wolBtn + imp);
     bindWeekBar(el, ids, id);
     const bindImp = () => {
+      const wb = $('[data-act=wtWol]', el);
+      if(wb) wb.onclick = async ()=>{ const s2 = $('[data-act=wtWolSt]', el); wb.disabled = true; s2.className='st';
+        try{ await WOL.importWeek(id || Weeks.thisId(), {mwb:false, wt:true}, m=>s2.textContent = m); Settings.set('weekSel', id || Weeks.thisId()); render(); }
+        catch(e){ s2.className='st err'; s2.textContent = e.message; wb.disabled = false; } };
       const st = $('[data-act=wtSt]', el); if(!st) return;
       $('[data-act=wtFiles]', el).onclick = ()=>$('[data-act=wtFile]', el).click();
       $('[data-act=wtFile]', el).onchange = async e=>{ const r = await importJWFiles([...e.target.files]); e.target.value=''; r.weeks.forEach(w=>Weeks.mergeInto(w));
@@ -1464,7 +1541,7 @@ const Views = {
         <label>내 해설 메모</label><textarea data-k="mine" style="min-height:60px" placeholder="내가 말할 해설을 적어 두세요.">${esc(an.mine||'')}</textarea>
       </div>`; }).join('')}
       ${a.review.length ? `<div class="card" style="margin-top:14px"><h2>❓ 복습 질문</h2><ul class="plan">${a.review.map(q=>`<li><span class="ic">•</span><div>${esc(q)}</div></li>`).join('')}</ul></div>` : ''}
-      <details class="more" style="margin-top:14px"><summary>다른 기사 불러오기·바꾸기</summary>${imp}</details>`);
+      <details class="more" style="margin-top:14px"><summary>다른 기사 불러오기·바꾸기</summary>${wolBtn}${imp}</details>`);
     bindImp();
     const saveAns = () => { const cur = Store.get('wt', id) || a; cur.ans = ans; Store.set('wt', id, cur); };
     $$('.qcard', el).forEach(card=>{
@@ -1924,7 +2001,7 @@ function bindImport(el){
     if(r.wt || r.bible) toast(`연구 기사 ${r.wt}개, 성경 읽기 ${r.bible}개도 함께 저장했습니다.`);
     if(r.weeks.length) apply(r.weeks, `파일 ${files.length}개`); else { st.className='st ok'; st.textContent = `연구 기사 ${r.wt}개, 성경 읽기 ${r.bible}개를 저장했습니다.`; } };
   $('#impPasteBtn', el).onclick = ()=>{ const b = $('#impPasteBox', el); b.hidden = !b.hidden; if(!b.hidden) $('#impPaste', el).focus(); };
-  $('#impPasteGo', el).onclick = ()=>apply(Weeks.parseWorkbook($('#impPaste', el).value), '붙여넣은 글');
+  $('#impPasteGo', el).onclick = ()=>apply(Weeks.parseWorkbook($('#impPaste', el).value, '', Settings.get('weekSel') || Weeks.thisId()), '붙여넣은 글');
   $('#impOld', el).onclick = async ()=>{
     st.className='st'; st.textContent='기존 임명표를 찾는 중…';
     const list = [];
@@ -1936,6 +2013,27 @@ function bindImport(el){
     const byId = {}; list.forEach(w=>{ const o = byId[w.id]; if(!o) byId[w.id] = w; else { byId[w.id] = {...o, ...Object.fromEntries(Object.entries(w).filter(([k,v])=>v && (!Array.isArray(v) || v.length)))}; } });
     apply(Object.values(byId).sort((a,b)=>a.id.localeCompare(b.id)), '기존 임명표' + (remoteErr ? ' (온라인은 못 읽음)' : ''));
   };
+}
+
+
+function bindWol(el){
+  const go = $('#wolGo', el); if(!go) return;
+  const st = $('#wolSt', el);
+  const run = async ids => {
+    const opts = {mwb:$('#wolMwb', el).checked, wt:$('#wolWt', el).checked};
+    if(!opts.mwb && !opts.wt){ st.className='st err'; st.textContent='집회 교재나 파수대 중 하나는 골라 주세요.'; return; }
+    go.disabled = true; $('#wolNext4', el).disabled = true; st.className='st'; const done = [];
+    for(const id of ids){
+      try{ const r = await WOL.importWeek(id, opts, m=>st.textContent = `${Weeks.labelOf(id)} — ${m}`);
+        done.push(`${Weeks.labelOf(id)} (${[r.mwb?'교재':'', r.wt?'파수대':''].filter(Boolean).join('·')})`); }
+      catch(e){ st.className='st err'; st.textContent = `${Weeks.labelOf(id)}: ${e.message}`; if(ids.length===1){ go.disabled = false; $('#wolNext4', el).disabled = false; return; } }
+    }
+    if(done.length){ Settings.set('weekSel', ids[0]); toast('가져왔습니다: '+done.join(', ')); render(); }
+    else { go.disabled = false; $('#wolNext4', el).disabled = false; }
+  };
+  go.onclick = ()=>{ const v = $('#wolDate', el).value; if(!v){ toast('날짜를 골라 주세요.'); return; } run([Weeks.ymd(Weeks.monday(new Date(v+'T00:00:00')))]); };
+  $('#wolNext4', el).onclick = ()=>{ const v = $('#wolDate', el).value || Weeks.thisId(); const m = Weeks.monday(new Date(v+'T00:00:00'));
+    run([0,1,2,3].map(k=>{ const d = new Date(m); d.setDate(m.getDate()+7*k); return Weeks.ymd(d); })); };
 }
 
 /* =========================================================
