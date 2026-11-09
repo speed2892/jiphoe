@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.4 (OpenRouter 웹 조사 연결)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.5 (OpenRouter 연결 오류 수정)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -336,8 +336,9 @@ const AI = (()=>{
     try{ if(window.claude && window.claude.use) sample = await window.claude.use('sample'); }catch(e){}
     document.dispatchEvent(new CustomEvent('aistate'));
   }
-  const key = () => (Settings.get('apiKey','')||'').trim();
-  const openRouterKey = () => (Settings.get('openrouterKey','')||'').trim();
+  const cleanKey = k => String(k||'').replace(/[^\x21-\x7E]/g,'');   // 키에 섞인 공백·한글·보이지 않는 문자 제거
+  const key = () => cleanKey(Settings.get('apiKey',''));
+  const openRouterKey = () => cleanKey(Settings.get('openrouterKey',''));
   const provider = () => Settings.get('aiProvider','openrouter');
   const model = () => Settings.get('model','claude-sonnet-5-5'); // 기존 Claude 모델(자료 조사 도구용)
   const openRouterModel = () => Settings.get('openrouterModel','openrouter/free');
@@ -397,7 +398,7 @@ const AI = (()=>{
       if(!openRouterKey()) throw new Error('OpenRouter API 키가 없습니다. 설정에서 키를 저장해 주세요.');
       const messages=[]; if(system) messages.push({role:'system',content:system}); messages.push({role:'user',content:prompt});
       const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',signal,
-        headers:{'content-type':'application/json','Authorization':'Bearer '+openRouterKey(),'HTTP-Referer':location.origin,'X-OpenRouter-Title':'집회 준비 도우미'},
+        headers:{'content-type':'application/json','Authorization':'Bearer '+openRouterKey(),'HTTP-Referer':location.origin,'X-Title':'Jiphoe Helper'},
         body:JSON.stringify({model:openRouterModel(),max_tokens:maxTokens,stream:true,messages})});
       if(!r.ok){const t=await r.text();let msg=t;try{const j=JSON.parse(t);msg=j.error?.message||t;}catch(e){} throw new Error(`OpenRouter 오류 ${r.status} — ${String(msg).slice(0,240)}`);}
       return readOpenRouterSSE(r,onText,signal);
@@ -420,7 +421,7 @@ const AI = (()=>{
       if(!k) throw new Error('OpenRouter API 키가 없습니다. 설정에서 OpenRouter 키를 저장해 주세요.');
       const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{
         method:'POST',
-        headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-OpenRouter-Title':'집회 준비 도우미'},
+        headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-Title':'Jiphoe Helper'},
         body:JSON.stringify({
           model:openRouterModel(),
           max_tokens:maxTokens,
@@ -465,8 +466,9 @@ const AI = (()=>{
     return out;
   }
   async function test(k, m, p='openrouter'){
+    k = cleanKey(k);
     if(p==='openrouter'){
-      const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-OpenRouter-Title':'집회 준비 도우미'},body:JSON.stringify({model:m||'openrouter/free',max_tokens:8,messages:[{role:'user',content:'안녕. 짧게 인사해 주세요.'}]})});
+      const r=await fetch('https://openrouter.ai/api/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json','Authorization':'Bearer '+k,'HTTP-Referer':location.origin,'X-Title':'Jiphoe Helper'},body:JSON.stringify({model:m||'openrouter/free',max_tokens:8,messages:[{role:'user',content:'안녕. 짧게 인사해 주세요.'}]})});
       if(!r.ok){const t=await r.text();let msg=t;try{const j=JSON.parse(t);msg=j.error?.message||t;}catch(e){}throw new Error(`오류 ${r.status} — ${String(msg).slice(0,240)}`);} return true;
     }
     const r = await fetch('https://api.anthropic.com/v1/messages', {method:'POST',
@@ -2243,7 +2245,7 @@ const Views = {
     $('#openrouterModel').value = s.get('openrouterModel','openrouter/free');
 
     /* AI */
-    $('#aiSave').onclick = ()=>{ const ok=$('#openrouterKey').value.trim(), ck=$('#apiKey').value.trim(), st=$('#aiSt');
+    $('#aiSave').onclick = ()=>{ const ck0=s=>String(s||'').replace(/[^\x21-\x7E]/g,''); const ok=ck0($('#openrouterKey').value), ck=ck0($('#apiKey').value), st=$('#aiSt');
       if(ok && !/^sk-or-/.test(ok)){ st.className='st err'; st.textContent='OpenRouter 키 형식을 확인해 주세요. 보통 sk-or-로 시작합니다.'; return; }
       if(ck && !/^sk-ant-/.test(ck)){ st.className='st err'; st.textContent='Claude 키는 sk-ant- 로 시작해야 합니다.'; return; }
       s.set('openrouterKey',ok); s.set('apiKey',ck); s.set('aiProvider',$('#aiProvider').value);
