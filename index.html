@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.4 (동영상 대본으로 토의 답)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.5 (Claude 무료 답 자동 넣기)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2219,7 +2219,8 @@ const Views = {
       ${JWVideo.titlesIn(p.detail).length || (kind==='life' && JWVideo.questionsIn(p.detail).length) ? `<div class="card"><h2>🎬 동영상과 토의 질문</h2>
         <p class="desc">교재에 나온 동영상의 자막(대본)을 jw.org에서 가져와, 아래 질문의 답을 동영상과 교재에서 찾습니다.</p>
         <div id="lvVids">${JWVideo.titlesIn(p.detail).map(t=>`<div class="note" data-vt="${esc(t)}">🎬 「${esc(t)}」 — 대본 불러오는 중…</div>`).join('')}</div>
-        <div class="row"><button class="btn" id="lvGo">💬 질문 답 만들기</button><button class="btn ghost" id="lvAsk">📋 요청 글 복사 (무료)</button><button class="btn ghost" id="lvCopy">답 복사</button></div><div class="st" id="lvSt"></div>
+        <div class="row"><button class="btn" id="lvGo">💬 질문 답 만들기</button><button class="btn ghost" id="lvAsk">📋 Claude에서 무료로 만들기</button><button class="btn ghost" id="lvPaste">📥 Claude 답 넣기</button><button class="btn ghost" id="lvCopy">답 복사</button></div>
+        <p class="desc" style="margin-top:4px">무료: ① ‘Claude에서 무료로 만들기’ → Claude가 열리면 보내기(요청 글이 안 보이면 길게 눌러 붙여넣기) → ② Claude 답을 복사 → ③ 앱으로 돌아오면 답이 자동으로 들어갑니다(안 되면 ‘Claude 답 넣기’).</p><div class="st" id="lvSt"></div>
         <div id="lvQs">${JWVideo.questionsIn(p.detail).map((q,i)=>`<div class="note" style="margin-top:10px"><b>${esc(q)}</b>${(pr.lv||{})['Q'+(i+1)] ? `<div style="white-space:pre-line;margin-top:6px">${esc(pr.lv['Q'+(i+1)])}</div>` : ''}</div>`).join('') || '<p class="desc">교재에서 질문을 찾지 못했습니다.</p>'}</div></div>` : ''}
       ${kind!=='reading' ? `<div class="card"><h2>📚 참조 자료</h2><p class="desc">교재에 달린 성구·「」 출판물 참조(예: 「파17.10」 23면 9-10항)를 찾아 요점을 정리합니다. 체크한 자료가 연설문에 반영됩니다. 조사하지 않고 만들기를 누르면 자동으로 먼저 찾습니다.</p><div id="prR"></div></div>` : ''}
       ${kind==='reading' ? `<div class="card"><h2>📜 낭독 본문</h2>${readTxt ? `<div class="scr">${esc(readTxt)}</div>` : `<p class="desc">${bible ? '본문에서 낭독 범위를 찾지 못했습니다.' : '성경범위 파일을 불러오면 낭독 본문이 여기에 나옵니다.'} (${esc(p.sub||'')})</p>`}</div>` : ''}
@@ -2255,10 +2256,27 @@ const Views = {
           save({lv}); st.className='st ok'; st.textContent = `${Object.keys(lv).length}개 질문의 답을 만들었습니다.`; setTimeout(render, 600);
         }catch(e){ st.className='st err'; st.textContent = '오류: '+e.message; }
         $('#lvGo').disabled = false; };
+      /* Claude 답(### Q1 …)을 질문에 나눠 넣기 */
+      const lvApply = txt => { const lv = {}; String(txt||'').replace(/\r/g,'').split(/^\s*(?:#{1,4}\s*)?\**\s*Q(\d+)[.:)\s]*\**/m).forEach((ch,i,a)=>{ if(i%2===1){ const body = (a[i+1]||'').trim(); if(body) lv['Q'+ch] = body.replace(/\*\*/g,'').replace(/^\s*[-–:]\s*/,'').trim(); } });
+        if(!Object.keys(lv).length) return 0; save({lv}); return Object.keys(lv).length; };
+      let lvWaiting = false;
+      const lvTryClipboard = async (quiet) => { const st = $('#lvSt');
+        try{ const t = await navigator.clipboard.readText(); const n = /Q\d/.test(t||'') ? lvApply(t) : 0;
+          if(n){ lvWaiting = false; toast(`Claude 답 ${n}개를 넣었습니다.`); render(); return true; }
+          if(!quiet && st){ st.className='st err'; st.textContent = '복사한 글에서 Q1, Q2… 답을 찾지 못했습니다. Claude 답 전체를 복사해 주세요.'; } }
+        catch(e){ if(!quiet && st){ st.className='st err'; st.textContent = '클립보드를 읽지 못했습니다. 아래 칸 대신 붙여넣을 수 있게 해 주세요(브라우저 권한).'; } }
+        return false; };
       $('#lvAsk').onclick = async ()=>{ const st = $('#lvSt');
         const vids = lvVids.length ? lvVids : (await Promise.all(lvTitles.map(t=>JWVideo.get(t).catch(()=>null)))).filter(Boolean);
-        const t = `${JWVideo.rules}\n\n${JWVideo.prompt(p, vids, lvQs, Research.materialText(prKey))}`;
-        try{ await navigator.clipboard.writeText(t); st.className='st ok'; st.textContent = `요청 글을 복사했습니다 (${t.length.toLocaleString()}자). Claude 채팅에 붙여넣으세요.`; }catch(e){ st.className='st err'; st.textContent='복사하지 못했습니다.'; } };
+        const t = `${JWVideo.rules}\n\n${JWVideo.prompt(p, vids, lvQs, Research.materialText(prKey))}\n\n(답은 반드시 "### Q1", "### Q2"처럼 질문 번호로 시작하십시오.)`;
+        try{ await navigator.clipboard.writeText(t); }catch(e){}
+        const enc = encodeURIComponent(t);
+        window.open(enc.length < 14000 ? 'https://claude.ai/new?q='+enc : 'https://claude.ai/new', '_blank', 'noopener');
+        lvWaiting = true; st.className='st ok';
+        st.textContent = `요청 글을 복사하고 Claude를 열었습니다 (${t.length.toLocaleString()}자). 입력칸이 비어 있으면 길게 눌러 붙여넣고 보내세요. 답을 복사해 돌아오면 자동으로 들어갑니다.`; };
+      $('#lvPaste').onclick = ()=>lvTryClipboard(false);
+      const lvBack = () => { if(lvWaiting && document.visibilityState==='visible' && $('#lvSt')) setTimeout(()=>lvTryClipboard(true), 400); };
+      document.addEventListener('visibilitychange', lvBack); window.addEventListener('focus', lvBack);
       $('#lvCopy').onclick = async ()=>{ const cur = (Store.get('practice', key)||{}).lv || {}; const t = lvQs.map((q,i)=>`${q}\n${cur['Q'+(i+1)]||''}`).join('\n\n');
         try{ await navigator.clipboard.writeText(t); toast('답을 복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
     }
