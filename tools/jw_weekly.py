@@ -285,6 +285,41 @@ def wol_ref(ref, ch, pages):
     body = html[html.find('<article'):] if '<article' in html else html
     return html_pages(body, pages) if pages else ''
 
+def study_verse(key):
+    """'24/51/6' → 연구용 성경의 연구 노트·각주·상호 참조·연구 자료 찾아보기(링크를 따라가 해당 면 글까지)"""
+    from bs4 import BeautifulSoup
+    b, c, v = key.split('/')
+    soup = BeautifulSoup(wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{b}/{c}'), 'html.parser')
+    sec = soup.select_one(f'div.section[data-key="{b}-{c}-{v}"]')
+    if not sec: return None
+    txt = lambda el: re.sub(r'\s+', ' ', el.get_text(' ', strip=True)).strip()
+    notes = [txt(li) for li in sec.select('.studyNoteGroup li.studyNote')]
+    foot = [txt(li) for li in sec.select('.group.footnote li')]
+    marg = [txt(li).lstrip('+') for li in sec.select('.group.marginal li')]
+    rsg_links = {}
+    for li in sec.select('.group.index li.ref-rsg'):
+        for a in li.select('a[href*="/wol/pc/"]'):
+            rsg_links[a['href']] = (rsg_links.get(a['href'], '') + ' ' + txt(a)).strip()
+    dx = [txt(li).replace('출판물 색인', '').strip() for li in sec.select('.group.index li.ref-dx')]
+    refs = []
+    for href, label in list(rsg_links.items())[:6]:
+        pm = re.search(r'(\d{1,4})(?:\s*-\s*(\d{1,4}))?\s*면', label)
+        pages = list(range(int(pm[1]), min(int(pm[2] or pm[1]), int(pm[1]) + 5) + 1)) if pm else []
+        try:
+            html = wol_get(href); body = html[html.find('<article'):] if '<article' in html else html
+            t = html_pages(body, pages) if pages else ''
+            if not t:
+                p = Text(); p.feed(body); t = '\n\n'.join(p.lines())[:4000]
+        except Exception as e: t = ''
+        refs.append({'ref': label, 'text': t, 'ok': bool(t)})
+    lines = []
+    if notes: lines.append('[연구 노트] ' + ' / '.join(notes))
+    if foot: lines.append('[각주] ' + ' / '.join(foot))
+    if rsg_links: lines.append('[연구 자료 찾아보기] ' + '; '.join(rsg_links.values()))
+    if dx: lines.append('[출판물 색인] ' + '; '.join(dx))
+    if marg: lines.append('[상호 참조] ' + ' / '.join(marg))
+    return {'notes': '\n'.join(lines) or '(연구 노트 없음)', 'refs': refs}
+
 def html_pages(html, pages, limit=12000):
     segs = re.split(r'<span[^>]*class="pageNum"[^>]*data-no="(\d+)"[^>]*>', html)
     want = set(pages); got = []
@@ -307,6 +342,15 @@ def handle_requests(gh, gid, gist):
     reqs = read(REQ_FILE) or []
     have = read(REF_FILE) or {}
     norm = [r if isinstance(r, dict) else {'ref': r} for r in reqs]
+    studies = [r['study'] for r in norm if r.get('study') and 'study:' + r['study'] not in have]
+    for k in studies[:40]:
+        try:
+            st = study_verse(k)
+            have['study:' + k] = dict(st or {'notes': '', 'refs': []}, ok=bool(st), at=dt.datetime.now(KST).isoformat(timespec='seconds'))
+            print(f"  {'✓' if st else '✗'} 연구 노트 {k} · 연구 자료 {len(st['refs']) if st else 0}개")
+        except Exception as e:
+            have['study:' + k] = {'ok': False, 'err': e.__class__.__name__, 'notes': '', 'refs': []}
+            print(f'  ✗ 연구 노트 {k} ({e.__class__.__name__} {getattr(e, "code", "")})')
     todo = [r for r in norm if r.get('ref') and (r['ref'] not in have or (not have[r['ref']].get('ok') and r.get('ch') and not have[r['ref']].get('wol')))]
     print(f'출판물 면 요청 {len(reqs)}개 (새로 {len(todo)}개)')
     for rq in todo[:30]:
@@ -324,7 +368,7 @@ def handle_requests(gh, gid, gist):
         except Exception as e:
             have[ref] = {'text': '', 'ok': False, 'err': e.__class__.__name__}
             print(f'  ✗ {ref[:40]} ({e.__class__.__name__})')
-    if todo:
+    if todo or studies:
         gh('/gists/' + gid, {'files': {REF_FILE: {'content': json.dumps(have, ensure_ascii=False)}}}, 'PATCH')
         print('요청한 면을 Gist에 저장했습니다.')
 
