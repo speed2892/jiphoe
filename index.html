@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.6 (참조 원문 자동 교체 보완)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.0 (연구 자료 찾아보기 면 가져오기)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -321,8 +321,12 @@ const Sync = (()=>{
     const f = g.files && g.files[name]; if(!f) return null;
     return (f.truncated && f.raw_url) ? await (await fetch(f.raw_url)).text() : f.content;
   }
+  async function writeFile(name, content){
+    if(!token()) throw new Error('동기화 토큰이 없습니다.');
+    await gh('/gists/'+await gistId(), {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({files:{[name]:{content}}})});
+  }
   return {
-    now, token, readFile,
+    now, token, readFile, writeFile,
     status(){ return {state, lastAt, err:lastErr}; },
     async connect(tok){
       Settings.set('ghToken', tok.trim()); Settings.set('gistId', null);
@@ -993,10 +997,49 @@ function keywordsOfText(s, n=8){
 }
 /* 출판물 참조: 「파17.10」 23-24면 11-12항, 「예레」 29면, 「랑제」 3과 요점 2 … */
 function extractPubRefs(text){
-  const out = [], re = /「([^」]{1,30})」\s*((?:\d+(?:-\d+)?\s*(?:면|과|장|항|단락|요점|부록\s*[가-힣A-Z]?)\s*,?\s*)*)/g; let m;
-  const t = String(text||''); while((m = re.exec(t))){ const r = (`「${m[1]}」 `+(m[2]||'').trim()).trim(); if(!out.includes(r)) out.push(r); }
+  /* 「예레」 165면 21항; 167면 25항 → 두 번째 것도 「예레」 167면 25항 으로 */
+  const out = [], LOC = '(?:\\d+(?:-\\d+)?\\s*(?:면|과|장|항|단락|요점|부록\\s*[가-힣A-Z]?)\\s*,?\\s*)';
+  const re = new RegExp(`「([^」]{1,30})」\\s*(${LOC}*)((?:;\\s*${LOC}+)*)`, 'g'); let m;
+  const add = r => { r = r.replace(/\s+/g,' ').replace(/[,;]\s*$/,'').trim(); if(!out.includes(r)) out.push(r); };
+  const t = String(text||''); while((m = re.exec(t))){ add(`「${m[1]}」 ${m[2]||''}`); (m[3]||'').split(';').map(x=>x.trim()).filter(x=>/면|과|장|항/.test(x)).forEach(x=>add(`「${m[1]}」 ${x}`)); }
   return out;
 }
+/* 연구 자료 찾아보기 등에 나오는 출판물 면(「파수대」 2008/6/15, 8-9면 · 「통찰」 제1권 785면)을
+   GitHub(jw-weekly)가 jw.org 공식 EPUB에서 꺼내 Gist의 jw-refs.json에 넣어 준다. 앱은 요청만 올린다. */
+const JWRefs = {
+  all(){ return Store.get('meta', 'jwrefs', {}) || {}; },
+  async load(){ try{ const raw = await Sync.readFile('jw-refs.json'); if(raw){ Store.set('meta', 'jwrefs', JSON.parse(raw)); } }catch(e){} return this.all(); },
+  /* '[연구 자료 찾아보기] 「파수대」 2008/6/15, 8-9면; 「통찰」 제1권 785면' → 참조 목록 */
+  parse(text){
+    const out = []; let last = '';
+    String(text||'').split(/\n/).filter(l=>/연구 자료 찾아보기|「/.test(l)).forEach(l=>{
+      l.replace(/^\[[^\]]*\]\s*/,'').split(/;/).map(x=>x.trim()).forEach(x=>{
+        const m = x.match(/「[^」]+」/); if(m) last = m[0]; else if(last && /^\d|^제\s*\d/.test(x)) x = `${last} ${x}`;
+        if(/「[^」]+」/.test(x) && /\d+\s*(-\s*\d+\s*)?면/.test(x)) out.push(x.replace(/\s+/g,' '));
+      });
+    });
+    return [...new Set(out)];
+  },
+  async request(refs){
+    if(!refs.length || !Sync.token()) return false;
+    let cur = []; try{ cur = JSON.parse(await Sync.readFile('jw-requests.json') || '[]'); }catch(e){}
+    const next = [...new Set([...cur, ...refs])]; if(next.length === cur.length) return true;
+    await Sync.writeFile('jw-requests.json', JSON.stringify(next.slice(-300)));
+    /* 바로 받아 오도록 GitHub 작업을 깨워 본다 (토큰에 권한이 없으면 1시간 안에 자동으로 돈다) */
+    try{ const [owner] = location.hostname.split('.'); const repo = location.pathname.split('/').filter(Boolean)[0] || 'jiphoe';
+      await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/jw-weekly.yml/dispatches`, {method:'POST',
+        headers:{'Authorization':'Bearer '+Sync.token(), 'Accept':'application/vnd.github+json', 'Content-Type':'application/json'}, body:JSON.stringify({ref:'main', inputs:{mode:'requests'}})}); }catch(e){}
+    return true;
+  },
+  /* 받아 둔 면 → 조사 항목, 아직 없는 것 → 요청 */
+  async items(refs){
+    const have = await this.load(), found = [], missing = [];
+    refs.forEach(r=>{ const h = have[r]; if(h && h.ok) found.push({id:'ref-'+r, kind:'pub', title:r, source:'출판물 (jw.org 공식 파일)', text:h.text, link:'', checked:true});
+      else if(!h) missing.push(r); });
+    if(missing.length) await this.request(missing).catch(()=>{});
+    return {found, missing, failed:refs.filter(r=>have[r] && !have[r].ok)};
+  }
+};
 const Research = {
   /* 출판물 참조: 그 주 집회 교재 페이지(wol)에서 해당 순서의 「」 참조 링크를 따라가 요점을 정리 */
   /* 자동 받은 교재 EPUB 안의 참조 본문 (JW Library가 오프라인으로 보여 주는 것) */
@@ -1120,6 +1163,17 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
     const hasLocal = !!(ctx && ctx.weekId && (Store.get('pubrefs', ctx.weekId)||[]).length);
     await step((opts.pubs || hasLocal) && (pubs.length || (ctx && ctx.weekId)), '출판물 참조', ()=>(opts.pubs ? this.pubRefs(pubs, ctx||{}, onStatus) : Promise.resolve(this.localPubRefs(pubs, ctx.weekId).found)));
     await step(opts.study && refs.length, '연구 노트', ()=>this.studyNotes(refs, onStatus));
+    /* 연구 노트의 '연구 자료 찾아보기'와 원문을 못 찾은 교재 참조 → GitHub가 받아 둔 면을 붙이거나 요청 */
+    if(Sync.token()){
+      const local = ctx && ctx.weekId ? this.localPubRefs(pubs, ctx.weekId) : {found:[], missing:pubs};
+      const want = [...new Set([...out.filter(i=>i.kind==='study').flatMap(i=>JWRefs.parse(i.text)), ...local.missing.filter(r=>/면/.test(r))])];
+      if(want.length){ onStatus && onStatus('참조 출판물 면 확인 중…');
+        try{ const r = await JWRefs.items(want); const got = new Set(r.found.map(f=>this.pubKey(f.title)));
+          for(let k = out.length-1; k>=0; k--){ if(out[k].kind==='pub' && got.has(this.pubKey(String(out[k].title).split(' — ')[0]))) out.splice(k,1); }
+          out.push(...r.found);
+          if(r.missing.length) errs.push(`출판물 ${r.missing.length}개는 GitHub에서 받는 중입니다 — 몇 분 뒤(늦어도 1시간) 🔎 조사하기를 다시 누르세요`);
+          if(r.failed.length) errs.push(`jw.org 파일에서 찾지 못한 면: ${r.failed.join(', ')}`);
+        }catch(e){ errs.push('참조 출판물 요청: '+e.message); } } }
     await step(opts.library, '내 자료', async()=>this.library(refs, kws));
     await step(opts.articles && (kws.length || queries.length), 'jw.org 기사', ()=>this.articles(kws, queries));
     await step(opts.exp && kws.length, '경험담', ()=>this.experiences(kws));
@@ -1129,7 +1183,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
   materialText(key){
     const r = Store.get('research', key); if(!r) return '';
     const pick = (r.items||[]).filter(i=>i.checked); if(!pick.length) return '';
-    const grp = {verse:'성구 본문', pub:'교재의 출판물 참조 요점', study:'연구 노트·연구 자료 찾아보기', lib:'내 자료(출판물) 발췌', article:'jw.org 자료', exp:'경험담·체험기(출판물 발췌)'};
+    const grp = {verse:'성구 본문', pub:'출판물 참조 원문·요점', study:'연구 노트·연구 자료 찾아보기', lib:'내 자료(출판물) 발췌', article:'jw.org 자료', exp:'경험담·체험기(출판물 발췌)'};
     return Object.keys(grp).map(k=>{ const g = pick.filter(i=>i.kind===k); return g.length ? `\n[${grp[k]}]\n` + g.map((i,n)=>`${n+1}. ${i.title} (${i.source})\n${i.text}`).join('\n\n') : ''; }).join('');
   },
   KIND: {verse:['📜','성구 본문'], pub:['📕','출판물 참조'], study:['📘','연구 노트'], lib:['📚','내 자료'], article:['📰','jw.org'], exp:['🌱','경험담']},
@@ -1503,7 +1557,7 @@ const JWAuto = {
       const files = (j.files||[]).map(f=>({name:f.name, text:async()=>f.text}));
       const r = await importJWFiles(files); r.weeks.forEach(w=>Weeks.mergeInto(w, {preferNew:true}));
       const st = {generated:j.generated, at:Date.now(), weeks:r.weeks.length, wt:r.wt, bible:r.bible, cbs:r.cbs||0, pubrefs:r.pubrefs||0};
-      Settings.set('jwAuto', st);
+      Settings.set('jwAuto', st); JWRefs.load();
       toast(`jw.org 자료를 받았습니다 — 교재 ${r.weeks.length}주 · 파수대 ${r.wt}개 · 성경 범위 ${r.bible}개 · 성서 연구 ${r.cbs||0}개 · 참조 출판물 ${r.pubrefs||0}개`);
       render(); return st;
     }catch(e){ if(!quiet) toast('jw.org 자료를 읽지 못했습니다: '+(e.message||e)); return null; }
@@ -2034,7 +2088,7 @@ const Views = {
         <textarea id="gOut" style="min-height:260px;margin-top:10px" placeholder="만든 해설이 여기에 나옵니다. 직접 고칠 수 있습니다.">${esc(g.out||'')}</textarea>
         ${leg.length ? `<details class="more"><summary>기존 집회 계획표에서 가져온 해설 ${leg.length}개</summary>${leg.map(x=>`<div class="note" style="white-space:pre-line">${esc(x.v)}</div>`).join('')}</details>` : ''}</div>`;
     bindWeekBar(el, ids, id);
-    Research.mount($('#gR', el), `gems:${id}`, {refs, kws:part ? keywordsOfText(part.detail, 6) : [], title:`${w.label} 영적 보물`});
+    Research.mount($('#gR', el), `gems:${id}`, {refs, kws:part ? keywordsOfText(part.detail, 6) : [], title:`${w.label} 영적 보물`, pubs:part ? extractPubRefs([part.title, part.sub, part.detail].join('\n')) : [], ctx:{weekId:id, title:part ? part.title : '영적 보물 찾기'}});
     if($('#gBible')){ $('#gBible').onclick = ()=>$('#gBibleFile').click(); $('#gBibleFile').onchange = async e=>{ await importJWFiles([...e.target.files]); render(); }; }
     const out = $('#gOut'); let tm; out.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>Store.set('gems', id, {...(Store.get('gems', id)||{}), out:out.value}), 400); };
     $('#gGo').onclick = async ()=>{ const st = $('#gSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
