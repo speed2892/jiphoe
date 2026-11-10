@@ -217,7 +217,7 @@ def find_cbs(wb):
     for n in spine(z):
         p = doc(z, n)
         if re.match(rf'\s*{num}(\s|$)', p.title or '') or re.match(rf'\s*{num}\s*(장|과)', p.title or ''):
-            return {'ref': ref.strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines()), 'cites': citations(z, n)}
+            return {'ref': (re.search(r'「[^」]+」[^(]*', ref) or [ref])[0].strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines()), 'cites': citations(z, n)}
     print('  회중 성서 연구 장을 못 찾음:', abbr, num); return None
 
 def safe(s): return re.sub(r'[\\/:*?"<>|“”‘’]', '', s).strip()[:60]
