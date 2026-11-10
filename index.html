@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.0 (jw.org 주간 자료 자동 받기)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.2 (회중 성서 연구 교재)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -632,7 +632,7 @@ const Weeks = {
         if(/^답을 적는 칸$/.test(l)) continue;
         let m;
         if((m = l.match(/^출처:\s*(\S+)/))){ w.src = m[1]; continue; }
-        if(!w.reading && !/노래|^\d+\./.test(l) && !w.parts.length && !part && l.length < 40){ w.reading = l; continue; }
+        if(!w.reading && !/노래|^\d+\.|^(성경에 담긴 보물|야외 봉사에 힘쓰십시오|그리스도인 생활)$/.test(l) && !w.parts.length && !part && l.length < 40){ w.reading = l; continue; }
         if(/^성경에 담긴 보물$/.test(l)){ flush(); sec='treasure'; continue; }
         if(/^야외 봉사에 힘쓰십시오$/.test(l)){ flush(); sec='ministry'; continue; }
         if(/^그리스도인 생활$/.test(l)){ flush(); sec='life'; continue; }
@@ -656,16 +656,16 @@ const Weeks = {
     }).filter(w=>w.id && w.parts.length);
   },
   /* 새로 들어온 주를 기존 주와 합치기: 교재 내용은 새것, 이름 배정은 비어 있지 않은 쪽 */
-  mergeInto(n){
+  mergeInto(n, {preferNew=false} = {}){
     const o = this.get(n.id);
     if(!o){ this.save(n); return 'new'; }
     const keep = (a,b) => (a && String(a).trim()) ? a : b;
-    const w = {...o, label:n.label||o.label, reading:n.reading||o.reading, src:n.src||o.src,
+    const w = {...o, label:n.label||o.label, reading:(n.reading && !/^성경에 담긴 보물$/.test(n.reading)) ? n.reading : (/^성경에 담긴 보물$/.test(o.reading||'') ? '' : o.reading), src:n.src||o.src,
       songs:[0,1,2].map(i=>n.songs[i]||o.songs[i]||''),
       chair:keep(o.chair,n.chair), prayerOpen:keep(o.prayerOpen,n.prayerOpen), prayerClose:keep(o.prayerClose,n.prayerClose), note:keep(o.note,n.note)};
     /* 순서 목록은 교재 내용이 더 풍부한 쪽을 바탕으로, 이름은 이미 적힌 것을 우선 */
     const score = ps => (ps||[]).length + 3*(ps||[]).filter(p=>p.detail).length;
-    const op = o.parts||[], np = n.parts||[], base = score(np) >= score(op) ? np : op, other = base===np ? op : np;
+    const op = o.parts||[], np = n.parts||[], base = (preferNew && np.length) || score(np) >= score(op) ? np : op, other = base===np ? op : np;
     w.parts = base.map(p=>{ const q = other.find(x=>x.no===p.no) || {};
       const oldP = base===np ? q : p, newP = base===np ? p : q;
       return {...p, who:keep(oldP.who, newP.who)||'', title:p.title||q.title||'', min:p.min||q.min||0, sub:p.sub||q.sub||'', detail:p.detail||q.detail||''}; });
@@ -1475,10 +1475,10 @@ const JWAuto = {
       const j = JSON.parse(raw); const prev = this.status();
       if(!force && prev && prev.generated===j.generated) return prev;
       const files = (j.files||[]).map(f=>({name:f.name, text:async()=>f.text}));
-      const r = await importJWFiles(files); r.weeks.forEach(w=>Weeks.mergeInto(w));
-      const st = {generated:j.generated, at:Date.now(), weeks:r.weeks.length, wt:r.wt, bible:r.bible};
+      const r = await importJWFiles(files); r.weeks.forEach(w=>Weeks.mergeInto(w, {preferNew:true}));
+      const st = {generated:j.generated, at:Date.now(), weeks:r.weeks.length, wt:r.wt, bible:r.bible, cbs:r.cbs||0};
       Settings.set('jwAuto', st);
-      toast(`jw.org 자료를 받았습니다 — 교재 ${r.weeks.length}주 · 파수대 ${r.wt}개 · 성경 범위 ${r.bible}개`);
+      toast(`jw.org 자료를 받았습니다 — 교재 ${r.weeks.length}주 · 파수대 ${r.wt}개 · 성경 범위 ${r.bible}개 · 성서 연구 ${r.cbs||0}개`);
       render(); return st;
     }catch(e){ if(!quiet) toast('jw.org 자료를 읽지 못했습니다: '+(e.message||e)); return null; }
   }
@@ -1490,6 +1490,7 @@ async function importJWFiles(files){
     const d = (name.match(/^(\d{4}-\d{2}-\d{2})_/)||[])[1];
     if(/집회교재/.test(name) || (!d && /성경에 담긴 보물/.test(text))){ res.weeks.push(...Weeks.parseWorkbook(text, name)); continue; }
     const wid = d ? Weeks.ymd(Weeks.monday(new Date(d+'T00:00:00'))) : null;
+    if(/회중성서연구/.test(name) && wid){ const [ref, ...rest] = text.split('\n'); Store.set('cbs', wid, {ref:ref.trim(), text:rest.join('\n').trim()}); res.cbs = (res.cbs||0)+1; continue; }
     if(/성경범위/.test(name) && wid){ Store.set('bible', wid, {range:(name.match(/성경범위_(.+)\.txt$/)||[])[1]||'', text}); res.bible++; continue; }
     if(wid){ const a = WT.parse(text); if(a.paras.length){ const old = Store.get('wt', wid); if(old && old.ans) a.ans = old.ans; Store.set('wt', wid, a); res.wt++; } }
   }
@@ -1693,6 +1694,7 @@ const Views = {
                        <input type="text" data-f="sub" value="${esc(p.sub)}" placeholder="부제·장면 (예: 호별 방문)" style="margin-top:6px">`
                     : `<div class="pt"><b>${p.no}. ${esc(p.title)||'<span style=\'color:var(--muted)\'>(제목 없음)</span>'}</b> <span class="badge" style="background:var(--s);color:var(--c)">${p.min||'-'}분</span>${me?' <span class="badge ok">내 과제</span>':''}</div>${p.sub?`<div class="ps">${esc(p.sub)}</div>`:''}`}
           ${p.detail && !editing ? `<details class="pd"><summary>교재 내용 보기</summary><div>${esc(p.detail).replace(/\n/g,'<br>')}</div></details>` : ''}
+          ${(()=>{ const c = !editing && /회중 성서 연구/.test(p.title||'') && Store.get('cbs', w.id); return c ? `<details class="pd"><summary>📘 연구 교재 본문 — ${esc(c.ref)}</summary><div style="max-height:60vh;overflow:auto">${esc(c.text).replace(/\n/g,'<br>')}</div></details>` : ''; })()}
         </div>
         <input type="text" class="who" data-f="who" list="nameList" value="${esc(p.who)}" placeholder="${p.sec==='ministry' && !/연설/.test(p.title) ? '학생 / 보조자' : '맡은 사람'}">
       </div>`;
@@ -2215,7 +2217,7 @@ const Views = {
         <div class="note">서로 다른 기기에서 같은 항목을 같은 시각에 수정한 내용은 자동으로 한쪽을 버리지 않고 충돌 보관함에 보존합니다. 현재 보관된 충돌: <b>${conflictCount}건</b>. 기기 날짜·시간은 ‘자동 설정’을 켜 두세요. 시계 차이가 크면 수정 순서 판단이 달라질 수 있습니다.
           <div class="row" style="margin-top:8px"><button class="btn ghost sm" id="syncConflictExport" ${conflictCount?'':'disabled'}>충돌 자료 내려받기</button></div>
         </div>
-        <div class="note">📥 <b>jw.org 주간 자료 자동 받기</b> — ${(()=>{ const a = JWAuto.status(); return a ? `마지막으로 받은 자료: ${esc(String(a.generated||'').replace('T',' ').slice(0,16))} (교재 ${a.weeks}주 · 파수대 ${a.wt}개 · 성경 범위 ${a.bible}개)` : '아직 받은 자료가 없습니다.'; })()}
+        <div class="note">📥 <b>jw.org 주간 자료 자동 받기</b> — ${(()=>{ const a = JWAuto.status(); return a ? `마지막으로 받은 자료: ${esc(String(a.generated||'').replace('T',' ').slice(0,16))} (교재 ${a.weeks}주 · 파수대 ${a.wt}개 · 성경 범위 ${a.bible}개 · 성서 연구 ${a.cbs||0}개)` : '아직 받은 자료가 없습니다.'; })()}
           <div class="row" style="margin-top:8px"><button class="btn ghost sm" id="jwAutoLoad" ${Sync.token()?'':'disabled'}>지금 불러오기</button><a class="btn ghost sm" href="https://github.com/speed2892/jiphoe/actions/workflows/jw-weekly.yml" target="_blank" rel="noopener">GitHub에서 새로 받기 ↗</a></div></div>
         <details class="more"><summary>토큰 만드는 방법</summary><ol class="desc" style="margin:8px 0 0;padding-left:18px">
           <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=jiphoe-hub" target="_blank" rel="noopener">여기</a>를 눌러 GitHub에 로그인 (권한은 gist 하나만 체크된 상태)</li>
