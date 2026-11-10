@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.5 (참조 원문 자동 교체)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.6 (참조 원문 자동 교체 보완)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1136,14 +1136,16 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
   /* 조사 패널을 화면에 붙이기 */
   mount(box, key, {refs=[], kws=[], title='', pubs=null, ctx=null} = {}){
     const saved = Store.get('research', key) || null;
-    const st = {refs: saved ? saved.refs : refs, kws: saved ? saved.kws : kws, pubs: saved && saved.pubs ? saved.pubs : (pubs||[]), items: saved ? saved.items : []};
+    const st = {refs: saved ? saved.refs : refs, kws: saved ? saved.kws : kws, pubs: saved && saved.pubs && saved.pubs.length ? saved.pubs : (pubs||[]), items: saved ? saved.items : []};
     const pubOn = pubs!==null || !!ctx;
-    if(pubOn && ctx && ctx.weekId && st.pubs.length){
-      const loc = this.localPubRefs(st.pubs, ctx.weekId).found;
+    if(pubOn && ctx && ctx.weekId){
+      /* 참조 목록이 비어 있으면 저장된 출판물 항목 제목에서 참조 표기를 되살린다 */
+      if(!st.pubs.length) st.pubs = [...new Set(st.items.filter(i=>i.kind==='pub').map(i=>String(i.title).split(' — ')[0].trim()).filter(Boolean))];
+      const loc = st.pubs.length ? this.localPubRefs(st.pubs, ctx.weekId).found : [];
       if(loc.length){ const keys = new Set(loc.map(l=>this.pubKey(l.title)));
         const before = st.items.length;
         st.items = [...loc, ...st.items.filter(i=>i.kind!=='pub' || !keys.has(this.pubKey(String(i.title).split(' — ')[0])))];
-        if(saved) Store.set('research', key, Object.assign({}, saved, {items:st.items})); } }
+        if(saved) Store.set('research', key, Object.assign({}, saved, {items:st.items, pubs:st.pubs})); } }
     const apiOn = !!(Settings.get('apiKey','')||'').trim() || (AI.provider()==='openrouter' && !!(Settings.get('openrouterKey','')||'').trim());
     const opts = Object.assign({verses:true, pubs:apiOn, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {})); if(!apiOn){ opts.pubs = false; opts.study = false; }
     const draw = () => {
