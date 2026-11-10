@@ -94,6 +94,25 @@ class Text(HTMLParser):
 def doc(z, name):
     p = Text(); p.feed(z.read(name).decode('utf-8', 'replace')); return p
 
+def citations(z, name, limit=12000):
+    """EPUB 안의 '-extracted.xhtml'에 들어 있는 출판물 참조 본문(JW Library가 오프라인에서 보여 주는 것)을 꺼낸다.
+       반환: [{ref:'「파17.10」 23면 9-10항', text:'…'}]"""
+    ext = re.sub(r'\.xhtml$', '-extracted.xhtml', name)
+    if ext not in z.namelist(): return []
+    main = z.read(name).decode('utf-8', 'replace')
+    labels = {}
+    for m in re.finditer(r'<a [^>]*href="[^"]*#(pcitation\d+)"[^>]*>(.*?)</a>', main, re.S):
+        labels[m[1]] = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m[2])).strip()
+    body = z.read(ext).decode('utf-8', 'replace')
+    parts = re.split(r'<span id="(pcitation\d+)"\s*>', body)
+    out = []
+    for k in range(1, len(parts) - 1, 2):
+        cid, seg = parts[k], parts[k + 1]
+        p = Text(); p.feed('<div><p>' + seg); t = '\n\n'.join(l for l in p.lines() if l != '^')
+        t = re.sub(r'^\^\s*', '', t).strip()
+        if t: out.append({'ref': labels.get(cid, cid), 'text': t[:limit]})
+    return out
+
 def md(d): return (d.month, d.day)
 
 def find_workbook(monday):
@@ -120,8 +139,10 @@ def find_workbook(monday):
                     for l in ls[:30]:
                         if RANGE.search(l): rng = RANGE.search(l)[1]; break
                 print('  교재 첫 줄:', ' / '.join(x[:24] for x in ls[:5]))
-                return ls, rng
-    return None, ''
+                cites = citations(z, n)
+                print(f'  교재 참조 출판물 {len(cites)}개')
+                return ls, rng, cites
+    return None, '', []
 
 def find_wt(monday):
     """이번 주 파수대 연구 기사: 앞부분에 'YYYY년 M월 D-…일' 이 있는 문서"""
@@ -196,7 +217,7 @@ def find_cbs(wb):
     for n in spine(z):
         p = doc(z, n)
         if re.match(rf'\s*{num}(\s|$)', p.title or '') or re.match(rf'\s*{num}\s*(장|과)', p.title or ''):
-            return {'ref': ref.strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines())}
+            return {'ref': ref.strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines()), 'cites': citations(z, n)}
     print('  회중 성서 연구 장을 못 찾음:', abbr, num); return None
 
 def safe(s): return re.sub(r'[\\/:*?"<>|“”‘’]', '', s).strip()[:60]
@@ -211,7 +232,7 @@ def main():
     for i in range(weeks):
         mon = mon0 + dt.timedelta(weeks=i); wid = mon.isoformat()
         print(f'{wid} 주')
-        wb, rng = find_workbook(mon)
+        wb, rng, cites = find_workbook(mon)
         if wb:
             label = wb[0].split('(')[0].strip()
             # 앱이 읽기 좋은 모양으로: 첫 줄 주 표시, 둘째 줄 성경 읽기 범위, 그다음 '노래…'부터 본문
@@ -219,7 +240,11 @@ def main():
             body = [label] + ([rng] if rng else []) + wb[i:]
             files.append({'name': f'{wid}_집회교재_{safe(label)}.txt', 'text': '\n\n'.join(body)})
             cbs = find_cbs(wb)
-            if cbs: files.append({'name': f"{wid}_회중성서연구_{safe(cbs['ref'])}.txt", 'text': f"{cbs['ref']}\n{cbs['title']}\n\n{cbs['text']}"})
+            if cbs:
+                files.append({'name': f"{wid}_회중성서연구_{safe(cbs['ref'])}.txt", 'text': f"{cbs['ref']}\n{cbs['title']}\n\n{cbs['text']}"})
+                cites = cites + [dict(c, where='cbs') for c in cbs.get('cites', [])]
+            if cites:
+                files.append({'name': f'{wid}_참조출판물.json', 'text': json.dumps(cites, ensure_ascii=False)})
             bt = bible_text(rng) if rng else None
             if bt: files.append({'name': f'{wid}_성경범위_{safe(rng)}.txt', 'text': bt})
             else: print(f'  성경 범위 못 찾음: {rng!r}')
