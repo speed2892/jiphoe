@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.2 (회중 성서 연구 교재)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.3 (회중 성서 연구 화면)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1490,7 +1490,7 @@ async function importJWFiles(files){
     const d = (name.match(/^(\d{4}-\d{2}-\d{2})_/)||[])[1];
     if(/집회교재/.test(name) || (!d && /성경에 담긴 보물/.test(text))){ res.weeks.push(...Weeks.parseWorkbook(text, name)); continue; }
     const wid = d ? Weeks.ymd(Weeks.monday(new Date(d+'T00:00:00'))) : null;
-    if(/회중성서연구/.test(name) && wid){ const [ref, ...rest] = text.split('\n'); Store.set('cbs', wid, {ref:ref.trim(), text:rest.join('\n').trim()}); res.cbs = (res.cbs||0)+1; continue; }
+    if(/회중성서연구/.test(name) && wid){ const [ref, ...rest] = text.split('\n'); Store.set('cbs', wid, {ref:ref.trim(), text:rest.join('\n').trim(), ans:(Store.get('cbs', wid)||{}).ans||{}}); res.cbs = (res.cbs||0)+1; continue; }
     if(/성경범위/.test(name) && wid){ Store.set('bible', wid, {range:(name.match(/성경범위_(.+)\.txt$/)||[])[1]||'', text}); res.bible++; continue; }
     if(wid){ const a = WT.parse(text); if(a.paras.length){ const old = Store.get('wt', wid); if(old && old.ans) a.ans = old.ans; Store.set('wt', wid, a); res.wt++; } }
   }
@@ -1611,10 +1611,53 @@ ${mwb ? `===집회교재===
 /* =========================================================
    6. 화면 (뷰)
    ========================================================= */
+/* =========================================================
+   5-8. 회중 성서 연구
+   cbs[주] = { ref:'「용하」 16장', text, ans:{ qid:{a, mine} } }
+   ========================================================= */
+const CBS = {
+  HEADS: ['성경 기록을 읽어 보십시오','토의해 보십시오','더 깊이 알아보기','교훈점 적용하기','시야를 넓혀 생각해 보기','더 찾아보기','복습','토의'],
+  parse(text){
+    const bl = String(text||'').replace(/﻿/g,'').split(/\n\s*\n/).map(x=>x.trim()).filter(Boolean);
+    const c = {num:'', person:'', title:'', story:[], verses:[], groups:[], more:[]};
+    let i = 0;
+    if(/^\d{1,3}\s/.test(bl[0]||'') && /^\d{1,3}\s/.test(bl[1]||'') && bl[0].split(' ')[0]===bl[1].split(' ')[0]) bl.shift();   // EPUB 제목 줄 중복
+    const m0 = (bl[0]||'').match(/^(\d{1,3})\s+(.+)$/); if(m0){ c.num = m0[1]; c.person = m0[2]; i = 1; }
+    if(bl[i] && !this.HEADS.includes(bl[i])) { c.title = bl[i]; i++; }
+    let sec = null, qn = 0;
+    for(; i<bl.length; i++){
+      const l = bl[i];
+      if(/^\^\s*\(/.test(l)){ c.verses.push(l.replace(/^\^\s*/,'')); continue; }
+      if(/^(또는|직역하면|달리 번역하면|용어 설명)/.test(l) || /^삽화\s*\S{0,2}$/.test(l) || l==='답을 적는 칸') continue;
+      if(this.HEADS.includes(l)){ sec = {head:l, qs:[]}; c.groups.push(sec); continue; }
+      if(!sec){ c.story.push(l); continue; }
+      if(bl[i+1]==='답을 적는 칸'){ qn++; sec.qs.push({id:'q'+qn, q:l}); continue; }
+      if(sec.head==='더 찾아보기' || sec.head==='성경 기록을 읽어 보십시오') { c.more.push({head:sec.head, t:l}); continue; }
+      c.more.push({head:sec.head, t:l});
+    }
+    c.groups = c.groups.filter(g=>g.qs.length);
+    return c;
+  },
+  rules: `당신은 여호와의 증인 회중 성서 연구에서 질문에 해설할 답을 준비하도록 돕는 도우미입니다.
+1. 답은 제공된 장 본문(성경 기록 이야기)과 성구 본문에서만 근거를 찾고, 없는 내용·인용을 지어내지 않습니다.
+2. 해설용 답은 자연스러운 한국어 구어체로 2-4문장(30초 이내)입니다. 핵심 요점을 먼저 말합니다.
+3. 성구는 꼭 필요할 때만 "사사기 4장 14절에서는 ~라고 말합니다"처럼 짧게 언급합니다.
+4. 질문에 「파15」 같은 출판물 참조가 붙어 있고 그 내용이 제공되지 않았으면, 장 본문과 성구로 답한 뒤 마지막에 "(자세한 내용: 「…」 참조)"라고만 덧붙입니다.
+5. 적용 질문(우리, 당신)에는 실생활 예를 한 가지 넣습니다.`,
+  material(c){ return `# 장: ${c.num} ${c.person} — ${c.title}\n# 이야기 본문\n${c.story.join('\n\n')}\n# 성구 본문\n${c.verses.join('\n')||'(없음)'}`; },
+  allPrompt(c){
+    const qs = c.groups.flatMap(g=>g.qs.map(q=>`### ${q.id} [${g.head}] ${q.q}`)).join('\n');
+    return `${this.material(c)}\n\n# 질문\n${qs}\n\n# 요청\n질문마다 해설용 답을 쓰십시오. 형식은 반드시 "### q번호" 줄 다음에 답만 쓰는 것입니다. 질문을 다시 적지 마십시오.`;
+  },
+  onePrompt(c, g, q, kind){
+    return `${this.material(c)}\n\n# 질문 [${g.head}]\n${q.q}\n\n# 요청\n${kind==='long' ? '이 질문에 대해 요점 3-4개를 들어 자세한 답(1분 분량)을 쓰십시오. 요점마다 근거가 되는 이야기 부분이나 성구를 밝히십시오.' : '이 질문에 해설용 답(2-4문장)을 쓰십시오.'} 답만 출력하십시오.`;
+  }
+};
 const VIEWS = [
   {id:'week',   icon:'🏠', title:'이번 주',     short:'이번 주'},
   {id:'wt',     icon:'📖', title:'파수대 연구', short:'파수대'},
   {id:'gems',   icon:'💎', title:'영적 보물',   short:'보물'},
+  {id:'cbs',    icon:'📘', title:'회중 성서 연구', short:'성서 연구'},
   {id:'talk',   icon:'🎤', title:'연설·실연',   short:'연설·실연'},
   {id:'public', icon:'🎙️', title:'공개 강연',   short:'공개 강연'},
   {id:'research', icon:'🔎', title:'자료 조사', short:'자료 조사', hideBottom:true},
@@ -1694,7 +1737,7 @@ const Views = {
                        <input type="text" data-f="sub" value="${esc(p.sub)}" placeholder="부제·장면 (예: 호별 방문)" style="margin-top:6px">`
                     : `<div class="pt"><b>${p.no}. ${esc(p.title)||'<span style=\'color:var(--muted)\'>(제목 없음)</span>'}</b> <span class="badge" style="background:var(--s);color:var(--c)">${p.min||'-'}분</span>${me?' <span class="badge ok">내 과제</span>':''}</div>${p.sub?`<div class="ps">${esc(p.sub)}</div>`:''}`}
           ${p.detail && !editing ? `<details class="pd"><summary>교재 내용 보기</summary><div>${esc(p.detail).replace(/\n/g,'<br>')}</div></details>` : ''}
-          ${(()=>{ const c = !editing && /회중 성서 연구/.test(p.title||'') && Store.get('cbs', w.id); return c ? `<details class="pd"><summary>📘 연구 교재 본문 — ${esc(c.ref)}</summary><div style="max-height:60vh;overflow:auto">${esc(c.text).replace(/\n/g,'<br>')}</div></details>` : ''; })()}
+          ${(()=>{ const c = !editing && /회중 성서 연구/.test(p.title||'') && Store.get('cbs', w.id); return c ? `<a class="btn ghost sm" href="#cbs" style="margin-top:6px">📘 연구 교재·질문 답 보기</a>` : ''; })()}
         </div>
         <input type="text" class="who" data-f="who" list="nameList" value="${esc(p.who)}" placeholder="${p.sec==='ministry' && !/연설/.test(p.title) ? '학생 / 보조자' : '맡은 사람'}">
       </div>`;
@@ -1875,6 +1918,73 @@ const Views = {
     $('#wtStop').onclick = ()=>{ if(wtAbort) wtAbort.abort(); };
     $('#wtCopy').onclick = async ()=>{ const txt = a.paras.map(p=>{ const an = ans[p.qn]||{}; return `${p.qn}. ${p.q}\n${an.mine || an.short || ''}`; }).join('\n\n');
       try{ await navigator.clipboard.writeText(txt); toast('답변을 복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
+  },
+  cbs(el){
+    const ids = [...new Set([...(Weeks.allIds ? Weeks.allIds() : Weeks.ids()), ...Object.keys(Store.all('cbs'))])].sort(); const id = pickWeek(ids);
+    const data = id ? Store.get('cbs', id) : null;
+    const w = id ? Weeks.get(id) : null;
+    const part = w && (w.parts||[]).find(p=>/회중 성서 연구/.test(p.title||''));
+    const c = data ? CBS.parse(data.text) : null;
+    const head = `<section class="hero"><div class="kicker">${id ? esc(Weeks.labelOf(id))+' · ' : ''}회중 성서 연구${part && part.who ? ' · 사회 '+esc(part.who) : ''}</div><h1>${c ? esc(`${c.num}장 ${c.person}`) : '회중 성서 연구'}</h1><p>${c ? esc(c.title) : (part && part.sub ? esc(part.sub) : '연구 교재를 불러오면 질문마다 해설할 답을 준비할 수 있습니다.')}</p><div class="big">📘</div></section>`;
+    const imp = `<div class="card"><h2>📥 연구 교재 불러오기</h2><p class="desc">보통은 <b>설정 → 동기화 → 📥 지금 불러오기</b>로 jw.org에서 자동으로 들어옵니다${part && part.sub ? ` (이번 주: ${esc(part.sub)})` : ''}. 직접 넣으려면 장 본문 전체를 붙여넣으세요.</p>
+      <textarea data-act="cbsPaste" placeholder="16 바락과 드보라&#10;“내가 반드시 당신과 함께 가겠습니다”&#10;…"></textarea>
+      <div class="row"><button class="btn" data-act="cbsPut">이 주에 넣기</button>${Sync.token() ? '<button class="btn ghost" data-act="cbsAuto">📥 jw.org 자료 지금 불러오기</button>' : ''}</div><div class="st" data-act="cbsSt"></div></div>`;
+    el.innerHTML = head + (ids.length ? weekBar(el, ids, id) : '') + (c ? '' : imp);
+    bindWeekBar(el, ids, id);
+    const bindImp = () => {
+      const put = $('[data-act=cbsPut]', el); if(!put) return;
+      put.onclick = ()=>{ const t = $('[data-act=cbsPaste]', el).value.trim(); const st = $('[data-act=cbsSt]', el);
+        if(!CBS.parse(t).groups.length){ st.className='st err'; st.textContent='질문을 찾지 못했습니다. 장 본문 전체를 붙여넣어 주세요.'; return; }
+        Store.set('cbs', id || Weeks.thisId(), {ref:(part && part.sub) || '', text:t, ans:{}}); render(); };
+      const au = $('[data-act=cbsAuto]', el); if(au) au.onclick = async ()=>{ au.disabled = true; await JWAuto.load({force:true, quiet:false}); };
+    };
+    if(!c){ bindImp(); return; }
+    const ans = data.ans || {};
+    const total = c.groups.reduce((n,g)=>n+g.qs.length, 0);
+    el.insertAdjacentHTML('beforeend', `
+      <style>.qcard{border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin-top:12px;background:var(--surface)}
+        .qcard .qh{font-weight:700} .qans{white-space:pre-line;background:var(--accent-soft);border-radius:10px;padding:10px 12px;margin-top:8px;font-size:.95rem}
+        .qans b{display:block;font-size:.78rem;color:var(--accent);margin-bottom:2px} .story p{margin:0 0 10px;line-height:1.75}</style>
+      <div class="card"><h2>🧭 ${esc(data.ref || '이번 주 연구')}</h2>
+        <p class="desc">이야기 ${c.story.length}문단 · 질문 ${total}개 · 성구 ${c.verses.length}개</p>
+        <div class="row"><button class="btn" id="cbsAll">💬 모든 질문 답 만들기</button><button class="btn danger" id="cbsStop" disabled>중지</button><button class="btn ghost" id="cbsCopy">답 모두 복사</button></div>
+        <div class="st" id="cbsSt"></div>
+        <details class="more"><summary>📖 이야기 본문 읽기</summary><div class="story" style="margin-top:10px">${c.story.map(t=>`<p>${esc(t)}</p>`).join('')}</div></details>
+        ${c.verses.length ? `<details class="more"><summary>📜 성구 본문 (${c.verses.length})</summary>${c.verses.map(v=>`<p class="desc" style="margin:8px 0">${esc(v)}</p>`).join('')}</details>` : ''}
+        ${c.more.length ? `<details class="more"><summary>📚 더 찾아보기</summary>${c.more.map(m=>`<p class="desc" style="margin:8px 0">${esc(m.t)}</p>`).join('')}</details>` : ''}
+      </div>
+      ${c.groups.map(g=>`<h3 style="margin:18px 4px 0;color:var(--accent)">▍${esc(g.head)}</h3>${g.qs.map(q=>{ const an = ans[q.id] || {}; return `<div class="qcard" data-q="${q.id}">
+        <div class="qh">${esc(q.q)}</div>
+        ${an.a ? `<div class="qans"><b>해설용 답</b>${esc(an.a)}</div>` : ''}${an.long ? `<div class="qans"><b>자세히</b>${esc(an.long)}</div>` : ''}
+        <div class="row"><button class="btn sm" data-k="a">${an.a ? '다시 만들기' : '답 만들기'}</button><button class="btn sm ghost" data-k="long">자세히</button></div>
+        <label>내 해설 메모</label><textarea data-k="mine" style="min-height:60px" placeholder="내가 말할 해설을 적어 두세요.">${esc(an.mine||'')}</textarea></div>`; }).join('')}`).join('')}
+      <details class="more" style="margin-top:14px"><summary>다른 교재 넣기·바꾸기</summary>${imp}</details>`);
+    bindImp();
+    const saveAns = () => { const cur = Store.get('cbs', id) || data; cur.ans = ans; Store.set('cbs', id, cur); };
+    const find = qid => { for(const g of c.groups){ const q = g.qs.find(x=>x.id===qid); if(q) return [g, q]; } return []; };
+    $$('.qcard', el).forEach(card=>{
+      const qid = card.dataset.q; const [g, q] = find(qid); ans[qid] ||= {};
+      const memo = $('textarea[data-k=mine]', card); let tm; memo.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>{ ans[qid].mine = memo.value; saveAns(); }, 400); };
+      $$('button[data-k]', card).forEach(b=>b.onclick = async ()=>{
+        if(!AI.mode()){ toast('설정에서 AI를 먼저 연결해 주세요.'); return; }
+        const k = b.dataset.k; b.disabled = true; const old = b.textContent; b.textContent = '작성 중…';
+        try{ const txt = await AI.write({system:CBS.rules, prompt:CBS.onePrompt(c, g, q, k), maxTokens:2000}); ans[qid][k] = txt.trim(); saveAns(); render(); }
+        catch(e){ toast('오류: '+e.message); b.disabled = false; b.textContent = old; }
+      });
+    });
+    let cbsAbort = null;
+    $('#cbsAll').onclick = async ()=>{
+      const st = $('#cbsSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
+      cbsAbort = new AbortController(); $('#cbsAll').disabled = true; $('#cbsStop').disabled = false; st.className='st';
+      try{ const txt = await AI.write({system:CBS.rules, prompt:CBS.allPrompt(c), signal:cbsAbort.signal, maxTokens:6000, onText:x=>{ st.textContent = `작성 중… ${(x.match(/^###/mg)||[]).length}/${total}`; }});
+        let n = 0; txt.split(/^###\s*/m).slice(1).forEach(chunk=>{ const qid = (chunk.match(/^q\d+/)||[])[0]; const body = chunk.slice(chunk.indexOf('\n')+1).trim(); if(qid && body && ans[qid]){ ans[qid].a = body; n++; } });
+        saveAns(); st.className='st ok'; st.textContent = `${n}개 질문의 답을 만들었습니다.`; setTimeout(render, 800);
+      }catch(e){ st.className='st err'; st.textContent = e.name==='AbortError' ? '중지했습니다.' : '오류: '+e.message; }
+      $('#cbsAll').disabled = false; $('#cbsStop').disabled = true; cbsAbort = null;
+    };
+    $('#cbsStop').onclick = ()=>{ if(cbsAbort) cbsAbort.abort(); };
+    $('#cbsCopy').onclick = async ()=>{ const txt = c.groups.map(g=>`[${g.head}]\n`+g.qs.map(q=>{ const an = ans[q.id]||{}; return `${q.q}\n${an.mine || an.a || ''}`; }).join('\n\n')).join('\n\n');
+      try{ await navigator.clipboard.writeText(txt); toast('답을 복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
   },
   gems(el){
     const ids = Weeks.ids(); const id = pickWeek(ids);
