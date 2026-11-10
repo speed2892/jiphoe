@@ -64,7 +64,8 @@ class Text(HTMLParser):
         a = dict(a)
         if tag == 'title': self.in_title = True; return
         if self.skip: self.skip += 1 if tag not in ('br', 'img') else 0; return
-        if tag == 'a' and 'noteref' in (a.get('epub:type') or ''): self.skip = 1; return
+        # 각주 표시(*)만 뺀다 — 성구 링크도 noteref 이므로 글은 살린다
+        if tag == 'a' and 'noteref' in (a.get('epub:type') or '') and 'footnote' in (a.get('href') or ''): self.skip = 1; return
         if 'w_navigation' in (a.get('class') or ''): self.skip = 1; return
         if tag in BLOCK:
             pid = a.get('data-pid')
