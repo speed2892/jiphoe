@@ -1,11 +1,20 @@
 name: jw.org 주간 자료 받기
 on:
   schedule:
-    - cron: '17 19 * * 0'   # 매주 월요일 새벽 4시 17분 (한국 시간)
-    - cron: '17 19 * * 3'   # 매주 목요일 새벽 4시 17분 (새 호가 늦게 올라온 경우 대비)
-  workflow_dispatch: {}      # Actions 화면에서 ‘Run workflow’로 바로 실행
+    - cron: '17 19 * * 0'   # 매주 월요일 새벽 4시 17분 (한국 시간): 주간 자료 전체
+    - cron: '17 19 * * 3'   # 매주 목요일 새벽 4시 17분: 주간 자료 전체 (늦게 올라온 호 대비)
+    - cron: '41 * * * *'    # 매시 41분: 앱이 요청한 출판물 면만 받기 (요청이 없으면 몇 초 만에 끝남)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'all = 주간 자료 전체, requests = 요청한 출판물 면만'
+        required: false
+        default: 'all'
 permissions:
   contents: read
+concurrency:
+  group: jw-weekly
+  cancel-in-progress: false
 jobs:
   fetch:
     runs-on: ubuntu-latest
@@ -19,4 +28,5 @@ jobs:
         env:
           JW_GIST_TOKEN: ${{ secrets.JW_GIST_TOKEN }}
           WEEKS: '4'
+          MODE: ${{ github.event.schedule == '41 * * * *' && 'requests' || github.event.inputs.mode || 'all' }}
         run: python tools/jw_weekly.py
