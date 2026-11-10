@@ -222,7 +222,10 @@ def find_cbs(wb):
     for n in spine(z):
         p = doc(z, n)
         if re.match(rf'\s*{num}(\s|$)', p.title or '') or re.match(rf'\s*{num}\s*(장|과)', p.title or ''):
-            return {'ref': (re.search(r'「[^」]+」[^(]*', ref) or [ref])[0].strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines()), 'cites': citations(z, n)}
+            doc = (re.search(r'(\d{7,})\.x?html$', n) or [None, ''])[1]
+            cites = citations(z, n)
+            print(f'  회중 성서 연구 {abbr} {num}장 (문서 {doc}) 참조 {len(cites)}개')
+            return {'ref': (re.search(r'「[^」]+」[^(]*', ref) or [ref])[0].strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines()), 'cites': cites, 'doc': doc}
     print('  회중 성서 연구 장을 못 찾음:', abbr, num); return None
 
 def safe(s): return re.sub(r'[\\/:*?"<>|“”‘’]', '', s).strip()[:60]
@@ -272,9 +275,9 @@ def wol_get(path):
         _wol[path] = get(WOL + path, headers={'Accept-Language': 'ko', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36'}).decode('utf-8', 'replace')
     return _wol[path]
 
-def wol_ref(ref, ch, pages):
-    """연구용 성경 장 페이지(연구 자료 찾아보기)에서 그 참조의 링크를 찾아 열고, 해당 면 글을 꺼낸다"""
-    page = wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{ch}')
+def wol_ref(ref, ch, pages, doc=''):
+    """연구용 성경 장 페이지(연구 자료 찾아보기) 또는 출판물 문서(doc)에서 그 참조의 링크를 찾아 열고, 해당 면 글을 꺼낸다"""
+    page = wol_get(f'/ko/wol/d/r8/lp-ko/{doc}' if doc else f'/ko/wol/b/r8/lp-ko/nwtsty/{ch}')
     links = {}
     for m in re.finditer(r'<a [^>]*href="(/ko/wol/pc/[^"]+)"[^>]*>(.*?)</a>', page, re.S):
         t = re.sub(r'<[^>]+>', '', m[2]); links[m[1]] = (links.get(m[1], '') + ' ' + t).strip()
@@ -351,7 +354,7 @@ def handle_requests(gh, gid, gist):
         except Exception as e:
             have['study:' + k] = {'ok': False, 'err': e.__class__.__name__, 'notes': '', 'refs': []}
             print(f'  ✗ 연구 노트 {k} ({e.__class__.__name__} {getattr(e, "code", "")})')
-    todo = [r for r in norm if r.get('ref') and (r['ref'] not in have or (not have[r['ref']].get('ok') and r.get('ch') and not have[r['ref']].get('wol')))]
+    todo = [r for r in norm if r.get('ref') and (r['ref'] not in have or (not have[r['ref']].get('ok') and (r.get('ch') or r.get('doc')) and not have[r['ref']].get('wol')))]
     print(f'출판물 면 요청 {len(reqs)}개 (새로 {len(todo)}개)')
     for rq in todo[:30]:
         ref, ch = rq['ref'], rq.get('ch', '')
@@ -360,10 +363,10 @@ def handle_requests(gh, gid, gist):
             z = epub(code, issue) if code else None
             t = pages_text(z, pages) if z else ''
             via = 'epub'
-            if not t and ch:
-                try: t = wol_ref(ref, ch, pages); via = 'wol'
+            if not t and (ch or rq.get('doc')):
+                try: t = wol_ref(ref, ch, pages, rq.get('doc', '')); via = 'wol'
                 except Exception as e: print(f'  wol 실패: {e.__class__.__name__} {getattr(e, "code", "")}')
-            have[ref] = {'text': t, 'ok': bool(t), 'pub': code or '', 'issue': issue or '', 'via': via, 'wol': bool(ch), 'at': dt.datetime.now(KST).isoformat(timespec='seconds')}
+            have[ref] = {'text': t, 'ok': bool(t), 'pub': code or '', 'issue': issue or '', 'via': via, 'wol': bool(ch or rq.get('doc')), 'at': dt.datetime.now(KST).isoformat(timespec='seconds')}
             print(f"  {'✓' if t else '✗'} {ref[:40]} → {code} {issue} {pages[:3]} {via} {len(t):,}자")
         except Exception as e:
             have[ref] = {'text': '', 'ok': False, 'err': e.__class__.__name__}
@@ -407,7 +410,7 @@ def weekly(gh, gid):
             files.append({'name': f'{wid}_집회교재_{safe(label)}.txt', 'text': '\n\n'.join(body)})
             cbs = find_cbs(wb)
             if cbs:
-                files.append({'name': f"{wid}_회중성서연구_{safe(cbs['ref'])}.txt", 'text': f"{cbs['ref']}\n{cbs['title']}\n\n{cbs['text']}"})
+                files.append({'name': f"{wid}_회중성서연구_{safe(cbs['ref'])}_{cbs.get('doc','')}.txt", 'text': f"{cbs['ref']}\n{cbs['title']}\n\n{cbs['text']}"})
                 cites = cites + [dict(c, where='cbs') for c in cbs.get('cites', [])]
             if cites:
                 files.append({'name': f'{wid}_참조출판물.json', 'text': json.dumps(cites, ensure_ascii=False)})
