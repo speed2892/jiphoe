@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.3 (성서 연구 참조 원문으로 답)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.4 (동영상 대본으로 토의 답)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1065,6 +1065,35 @@ const JWStudy = {
     return {items, missing:miss.length};
   }
 };
+/* 교재의 동영상 「제목」 → jw.org 동영상의 자막(대본)을 가져와 토의 질문의 답을 찾는 데 쓴다 */
+const JWVideo = {
+  titlesIn(t){ return [...String(t||'').matchAll(/동영상\s*「([^」]+)」/g)].map(m=>m[1].trim()).filter((x,i,a)=>a.indexOf(x)===i); },
+  questionsIn(t){ return String(t||'').split(/\n/).map(l=>l.trim()).filter(l=>/[?？]\s*(\([^)]*\))?$/.test(l) && !/^동영상/.test(l)); },
+  vttText(v){ const out = []; String(v||'').replace(/\r/g,'').split(/\n\n+/).forEach(b=>{ const ls = b.split('\n').filter(l=>l && !/-->/.test(l) && !/^WEBVTT|^\d+$|^NOTE/.test(l)); const t = ls.join(' ').replace(/<[^>]+>/g,'').trim(); if(t && out[out.length-1]!==t) out.push(t); }); return out.join('\n'); },
+  async get(title){
+    const cache = Store.get('videos', title); if(cache && cache.text) return cache;
+    const r = await fetch(`https://b.jw-cdn.org/apis/search/results/KO/videos?q=${encodeURIComponent(title)}&limit=5`, {headers:{Authorization:'Bearer '+await getToken()}});
+    if(!r.ok) throw new Error('동영상 검색 '+r.status);
+    const j = await r.json(); const items = []; (function walk(n){ if(n.type==='item') items.push(n); (n.results||[]).forEach(walk); })({results:j.results||[]});
+    const norm = x => plain(x).replace(/\s/g,'');
+    const hit = items.find(i=>norm(i.title)===norm(title)) || items.find(i=>norm(i.title).startsWith(norm(title)) && !/화면 해설/.test(plain(i.title))) || items[0];
+    if(!hit || !hit.lank) throw new Error('동영상을 찾지 못했습니다');
+    const m = await (await fetch(`https://b.jw-cdn.org/apis/mediator/v1/media-items/KO/${hit.lank}?clientType=www`)).json();
+    const media = (m.media||[])[0]; if(!media) throw new Error('동영상 정보를 받지 못했습니다');
+    const sub = ((media.files||[]).find(f=>f.subtitles)||{}).subtitles;
+    if(!sub) throw new Error('이 동영상에는 자막이 없습니다');
+    const text = this.vttText(await (await fetch(sub.url)).text());
+    const v = {title:media.title || title, lank:hit.lank, dur:media.duration||0, link:`https://www.jw.org/finder?lank=${hit.lank}&wtlocale=KO`, text};
+    Store.set('videos', title, v); return v;
+  },
+  rules: `당신은 여호와의 증인 집회의 토의 순서(그리스도인 생활)를 준비하는 사람을 돕습니다.
+1. 질문마다 해설용 답을 2-4문장 구어체로 씁니다.
+2. 답의 근거는 제공된 '동영상 대본'과 '교재 내용'에서만 찾습니다. 동영상에 나온 장면·말을 근거로 쓸 때는 "동영상에서 ~했습니다"처럼 밝힙니다.
+3. 대본이나 교재에 없는 내용, 숫자, 인용은 지어내지 않습니다. 한국어로만 씁니다.`,
+  prompt(p, vids, qs, mat){
+    return `# 순서: ${p.no}. ${p.title} (${p.min}분)\n# 교재 내용\n${p.detail||''}\n${vids.map(v=>`# 동영상 대본 「${v.title}」\n${v.text}`).join('\n')}${mat ? `\n# 조사 자료\n${mat}` : ''}\n\n# 질문\n${qs.map((q,i)=>`### Q${i+1} ${q}`).join('\n')}\n\n# 요청\n질문마다 "### Q번호" 줄 다음에 답만 쓰십시오. 질문을 다시 적지 마십시오.`;
+  }
+};
 const Research = {
   /* 출판물 참조: 그 주 집회 교재 페이지(wol)에서 해당 순서의 「」 참조 링크를 따라가 요점을 정리 */
   /* 자동 받은 교재 EPUB 안의 참조 본문 (JW Library가 오프라인으로 보여 주는 것) */
@@ -1871,6 +1900,7 @@ const Views = {
                     : `<div class="pt"><b>${p.no}. ${esc(p.title)||'<span style=\'color:var(--muted)\'>(제목 없음)</span>'}</b> <span class="badge" style="background:var(--s);color:var(--c)">${p.min||'-'}분</span>${me?' <span class="badge ok">내 과제</span>':''}</div>${p.sub?`<div class="ps">${esc(p.sub)}</div>`:''}`}
           ${p.detail && !editing ? `<details class="pd"><summary>교재 내용 보기</summary><div>${esc(p.detail).replace(/\n/g,'<br>')}</div></details>` : ''}
           ${(()=>{ const c = !editing && /회중 성서 연구/.test(p.title||'') && Store.get('cbs', w.id); return c ? `<a class="btn ghost sm" href="#cbs" style="margin-top:6px">📘 연구 교재·질문 답 보기</a>` : ''; })()}
+          ${!editing && JWVideo.titlesIn(p.detail).length ? `<button class="btn ghost sm" data-golv="${p.no}" data-wid="${w.id}" style="margin-top:6px">🎬 동영상·토의 질문 답 보기</button>` : ''}
         </div>
         <input type="text" class="who" data-f="who" list="nameList" value="${esc(p.who)}" placeholder="${p.sec==='ministry' && !/연설/.test(p.title) ? '학생 / 보조자' : '맡은 사람'}">
       </div>`;
@@ -2186,6 +2216,11 @@ const Views = {
       <div class="card"><label style="margin-top:0">연습할 과제</label><select id="prSel">${parts.map(x=>`<option value="${x.no}" ${x.no===no?'selected':''}>${x.no}. ${esc(x.title)} (${x.min}분)${Weeks.isMine(x.who)?' — 내 과제':''}</option>`).join('')}</select>
         ${p.detail ? `<details class="more" open><summary>교재 내용</summary><div class="desc" style="white-space:pre-line;margin-top:8px">${esc(p.detail)}</div></details>` : ''}
         ${prSrcInfo}</div>
+      ${JWVideo.titlesIn(p.detail).length || (kind==='life' && JWVideo.questionsIn(p.detail).length) ? `<div class="card"><h2>🎬 동영상과 토의 질문</h2>
+        <p class="desc">교재에 나온 동영상의 자막(대본)을 jw.org에서 가져와, 아래 질문의 답을 동영상과 교재에서 찾습니다.</p>
+        <div id="lvVids">${JWVideo.titlesIn(p.detail).map(t=>`<div class="note" data-vt="${esc(t)}">🎬 「${esc(t)}」 — 대본 불러오는 중…</div>`).join('')}</div>
+        <div class="row"><button class="btn" id="lvGo">💬 질문 답 만들기</button><button class="btn ghost" id="lvAsk">📋 요청 글 복사 (무료)</button><button class="btn ghost" id="lvCopy">답 복사</button></div><div class="st" id="lvSt"></div>
+        <div id="lvQs">${JWVideo.questionsIn(p.detail).map((q,i)=>`<div class="note" style="margin-top:10px"><b>${esc(q)}</b>${(pr.lv||{})['Q'+(i+1)] ? `<div style="white-space:pre-line;margin-top:6px">${esc(pr.lv['Q'+(i+1)])}</div>` : ''}</div>`).join('') || '<p class="desc">교재에서 질문을 찾지 못했습니다.</p>'}</div></div>` : ''}
       ${kind!=='reading' ? `<div class="card"><h2>📚 참조 자료</h2><p class="desc">교재에 달린 성구·「」 출판물 참조(예: 「파17.10」 23면 9-10항)를 찾아 요점을 정리합니다. 체크한 자료가 연설문에 반영됩니다. 조사하지 않고 만들기를 누르면 자동으로 먼저 찾습니다.</p><div id="prR"></div></div>` : ''}
       ${kind==='reading' ? `<div class="card"><h2>📜 낭독 본문</h2>${readTxt ? `<div class="scr">${esc(readTxt)}</div>` : `<p class="desc">${bible ? '본문에서 낭독 범위를 찾지 못했습니다.' : '성경범위 파일을 불러오면 낭독 본문이 여기에 나옵니다.'} (${esc(p.sub||'')})</p>`}</div>` : ''}
       <div class="card"><h2>📝 ${kind==='demo' ? '실연 예시 대본' : kind==='reading' ? '낭독 연습 도움말' : kind==='life' ? '진행 메모' : '연설문'}</h2>
@@ -2203,6 +2238,30 @@ const Views = {
         <div class="row"><button class="btn" id="prFb">🤖 피드백 받기</button></div><div class="st" id="prFbSt"></div>
         ${pr.feedback ? `<div class="scr" style="margin-top:10px">${esc(pr.feedback)}</div>` : ''}</div>`;
     bindWeekBar(el, ids, id);
+    /* 동영상 대본 불러오기 + 토의 질문 답 */
+    const lvTitles = JWVideo.titlesIn(p.detail), lvQs = JWVideo.questionsIn(p.detail), lvVids = [];
+    if($('#lvVids')){
+      lvTitles.forEach(async t=>{ const box = $(`[data-vt="${CSS.escape(t)}"]`, el);
+        try{ const v = await JWVideo.get(t); lvVids.push(v);
+          box.innerHTML = `🎬 <b>「${esc(v.title)}」</b> ${v.dur ? `(${Math.floor(v.dur/60)}분 ${Math.round(v.dur%60)}초)` : ''} · <a href="${v.link}" target="_blank" rel="noopener">동영상 보기 ↗</a><details class="pd"><summary>📝 동영상 대본 (자막)</summary><div style="max-height:45vh;overflow:auto;white-space:pre-line">${esc(v.text)}</div></details>`; }
+        catch(e){ box.textContent = `🎬 「${t}」 — 대본을 가져오지 못했습니다 (${e.message})`; } });
+      $('#lvGo').onclick = async ()=>{
+        const st = $('#lvSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결하거나, 아래 ‘📋 요청 글 복사’를 쓰세요.'; return; }
+        if(!lvQs.length){ st.className='st err'; st.textContent='질문을 찾지 못했습니다.'; return; }
+        $('#lvGo').disabled = true; st.className='st'; st.textContent = '동영상 대본과 교재로 답을 만드는 중…';
+        try{ const vids = lvVids.length ? lvVids : (await Promise.all(lvTitles.map(t=>JWVideo.get(t).catch(()=>null)))).filter(Boolean);
+          const txt = await AI.write({system:JWVideo.rules, prompt:JWVideo.prompt(p, vids, lvQs, Research.materialText(prKey)), maxTokens:3000});
+          const lv = {}; txt.split(/^###\s*/m).slice(1).forEach(ch=>{ const id = (ch.match(/^Q\d+/)||[])[0]; if(id) lv[id] = ch.slice(ch.indexOf('\n')+1).trim(); });
+          save({lv}); st.className='st ok'; st.textContent = `${Object.keys(lv).length}개 질문의 답을 만들었습니다.`; setTimeout(render, 600);
+        }catch(e){ st.className='st err'; st.textContent = '오류: '+e.message; }
+        $('#lvGo').disabled = false; };
+      $('#lvAsk').onclick = async ()=>{ const st = $('#lvSt');
+        const vids = lvVids.length ? lvVids : (await Promise.all(lvTitles.map(t=>JWVideo.get(t).catch(()=>null)))).filter(Boolean);
+        const t = `${JWVideo.rules}\n\n${JWVideo.prompt(p, vids, lvQs, Research.materialText(prKey))}`;
+        try{ await navigator.clipboard.writeText(t); st.className='st ok'; st.textContent = `요청 글을 복사했습니다 (${t.length.toLocaleString()}자). Claude 채팅에 붙여넣으세요.`; }catch(e){ st.className='st err'; st.textContent='복사하지 못했습니다.'; } };
+      $('#lvCopy').onclick = async ()=>{ const cur = (Store.get('practice', key)||{}).lv || {}; const t = lvQs.map((q,i)=>`${q}\n${cur['Q'+(i+1)]||''}`).join('\n\n');
+        try{ await navigator.clipboard.writeText(t); toast('답을 복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
+    }
     if($('#prR')) Research.mount($('#prR'), prKey, {refs:prRefs, kws:keywordsOfText([p.title, p.detail].join(' '), 6), title:`${w.label} ${no}. ${p.title}`, pubs:prPubs, ctx:prCtx});
     const save = (patch) => Store.set('practice', key, {...(Store.get('practice', key)||{}), ...patch});
     $('#prSel').onchange = e=>{ Settings.set('prPart:'+id, e.target.value); render(); };
@@ -2776,6 +2835,7 @@ Store.on(info=>{ if(info.remote && ['week','settings'].includes(current) && !doc
 
 /* 앱을 새로 열 때 지난 주가 선택되어 있으면 이번 주로 돌아오기 */
 if((Settings.get('weekSel')||'') < Weeks.thisId()) Settings.set('weekSel', Weeks.thisId());
+document.addEventListener('click', e=>{ const b = e.target.closest && e.target.closest('[data-golv]'); if(!b) return; Settings.set('prPart:'+b.dataset.wid, b.dataset.golv); Settings.set('weekSel', b.dataset.wid); location.hash = '#talk'; });
 applyTheme(); render(); refreshPills(); AI.probe(); if(Sync.token()){ Sync.now(); setTimeout(()=>JWAuto.load(), 1500); }
 /* 새 버전 확인: GitHub Pages는 파일을 최대 10분 캐시하므로, 서버의 index.html 버전을 직접 비교해 알려 준다 */
 if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
