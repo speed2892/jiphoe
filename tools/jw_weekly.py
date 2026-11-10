@@ -103,6 +103,11 @@ def citations(z, name, limit=12000):
     labels = {}
     for m in re.finditer(r'<a [^>]*href="[^"]*#(pcitation\d+)"[^>]*>(.*?)</a>', main, re.S):
         labels[m[1]] = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m[2])).strip()
+    last = ''
+    for cid in sorted(labels, key=lambda x: int(x[9:])):       # '167면 25항' 처럼 약호가 빠진 링크는 앞 링크의 「약호」를 붙인다
+        m = re.match(r'(「[^」]+」)', labels[cid])
+        if m: last = m[1]
+        elif last and re.match(r'\d', labels[cid]): labels[cid] = f'{last} {labels[cid]}'
     body = z.read(ext).decode('utf-8', 'replace')
     parts = re.split(r'<span id="(pcitation\d+)"\s*>', body)
     out = []
@@ -222,9 +227,96 @@ def find_cbs(wb):
 
 def safe(s): return re.sub(r'[\\/:*?"<>|“”‘’]', '', s).strip()[:60]
 
+# ---------- 요청한 출판물 면 가져오기 (연구 자료 찾아보기의 「파수대」 2008/6/15, 8-9면 · 「통찰」 제1권 785면 등) ----------
+REQ_FILE, REF_FILE = 'jw-requests.json', 'jw-refs.json'
+PERIODICAL = {'파수대': 'w', '파': 'w', '깨어라!': 'g', '깨': 'g', '깨어라': 'g'}
+
+def resolve(ref):
+    """참조 표기 → (출판물 기호, 호, [면들])"""
+    r = ref.replace(' ', ' ')
+    pages = []
+    pm = re.search(r'(\d{1,4})(?:\s*-\s*(\d{1,4}))?\s*면', r)
+    if pm:
+        a = int(pm[1]); b = int(pm[2] or pm[1]); pages = list(range(a, min(b, a + 6) + 1))
+    m = re.search(r'「([^」]+)」', r)
+    if not m or not pages: return None, None, pages
+    ab = m[1].strip(); rest = r[m.end():]
+    # 「파수대」 2008/6/15 · 「깨어라!」 2010/5
+    mm = re.match(r'(파수대|깨어라!?)$', ab)
+    if mm:
+        d = re.search(r'(\d{4})\s*/\s*(\d{1,2})(?:\s*/\s*(\d{1,2}))?', rest)
+        if d: return PERIODICAL[mm[1]], f'{d[1]}{int(d[2]):02d}' + (f'{int(d[3]):02d}' if d[3] else ''), pages
+    # 「파15」 8/1 · 「파17.10」 · 「깨10」 5/8
+    mm = re.match(r'(파|깨)(\d{2})(?:\.(\d{1,2}))?$', ab)
+    if mm:
+        yy = int(mm[2]); year = 2000 + yy if yy < 50 else 1900 + yy
+        if mm[3]: return PERIODICAL[mm[1]], f'{year}{int(mm[3]):02d}', pages
+        d = re.match(r'\s*(\d{1,2})\s*/\s*(\d{1,2})', rest)
+        if d: return PERIODICAL[mm[1]], f'{year}{int(d[1]):02d}{int(d[2]):02d}', pages
+        d = re.match(r'\s*(\d{1,2})\s*월', rest)
+        if d: return PERIODICAL[mm[1]], f'{year}{int(d[1]):02d}', pages
+    # 「통찰」 제1권 / 제2권
+    if ab.startswith('통찰'):
+        v = re.search(r'제\s*(\d)\s*권', rest)
+        return (f'it-{v[1]}' if v else 'it-1'), '', pages
+    return pub_code(ab), '', pages
+
+def pages_text(z, pages, limit=12000):
+    """EPUB 안의 면 표시(pageNum)를 따라 해당 면의 글만 꺼낸다"""
+    html = ''.join(z.read(n).decode('utf-8', 'replace') for n in spine(z))
+    segs = re.split(r'<span[^>]*class="pageNum"[^>]*data-no="(\d+)"[^>]*>', html)
+    want = set(pages); got = []
+    for k in range(1, len(segs) - 1, 2):
+        if int(segs[k]) in want: got.append(segs[k + 1])
+    if not got: return ''
+    p = Text(); p.feed('<div><p>' + ''.join(got))
+    return '\n\n'.join(l for l in p.lines() if l not in ('답을 적는 칸',))[:limit]
+
+def handle_requests(gh, gid, gist):
+    files = gist.get('files', {})
+    def read(name):
+        f = files.get(name)
+        if not f: return None
+        c = f.get('content') if not f.get('truncated') else get(f['raw_url']).decode()
+        try: return json.loads(c)
+        except Exception: return None
+    reqs = read(REQ_FILE) or []
+    have = read(REF_FILE) or {}
+    todo = [r for r in reqs if isinstance(r, str) and r not in have]
+    print(f'출판물 면 요청 {len(reqs)}개 (새로 {len(todo)}개)')
+    for ref in todo[:30]:
+        try:
+            code, issue, pages = resolve(ref)
+            z = epub(code, issue) if code else None
+            t = pages_text(z, pages) if z else ''
+            have[ref] = {'text': t, 'ok': bool(t), 'pub': code or '', 'issue': issue or '', 'at': dt.datetime.now(KST).isoformat(timespec='seconds')}
+            print(f"  {'✓' if t else '✗'} {ref[:40]} → {code} {issue} {pages[:3]} {len(t):,}자")
+        except Exception as e:
+            have[ref] = {'text': '', 'ok': False, 'err': e.__class__.__name__}
+            print(f'  ✗ {ref[:40]} ({e.__class__.__name__})')
+    if todo:
+        gh('/gists/' + gid, {'files': {REF_FILE: {'content': json.dumps(have, ensure_ascii=False)}}}, 'PATCH')
+        print('요청한 면을 Gist에 저장했습니다.')
+
 def main():
     token = os.environ.get('JW_GIST_TOKEN', '').strip()
     if not token: sys.exit('JW_GIST_TOKEN 비밀값이 없습니다.')
+    mode = os.environ.get('MODE', 'all')
+    gh = lambda path, body=None, method=None: json.loads(get('https://api.github.com' + path,
+        data=json.dumps(body).encode() if body is not None else None, method=method,
+        headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}) or b'{}')
+    gid = os.environ.get('JW_GIST_ID', '').strip()
+    if not gid:
+        gists = gh('/gists?per_page=100')
+        g = next((g for g in gists if g.get('description') == GIST_DESC), None)
+        if not g: sys.exit('동기화 Gist(jiphoe-hub-sync)를 찾지 못했습니다. 앱에서 Gist 동기화를 먼저 연결하세요.')
+        gid = g['id']
+    gist = gh('/gists/' + gid)
+    handle_requests(gh, gid, gist)
+    if mode == 'requests': return
+    weekly(gh, gid)
+
+def weekly(gh, gid):
     weeks = int(os.environ.get('WEEKS', '4'))
     today = dt.datetime.now(KST).date()
     mon0 = today - dt.timedelta(days=today.weekday())
@@ -257,15 +349,6 @@ def main():
     for f in files: print(f"  → {f['name'][:40]}… {len(f['text']):,}자")
     payload = json.dumps({'v': 1, 'generated': dt.datetime.now(KST).isoformat(timespec='seconds'), 'files': files}, ensure_ascii=False)
 
-    gh = lambda path, body=None, method=None: json.loads(get('https://api.github.com' + path,
-        data=json.dumps(body).encode() if body is not None else None, method=method,
-        headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}) or b'{}')
-    gid = os.environ.get('JW_GIST_ID', '').strip()
-    if not gid:
-        gists = gh('/gists?per_page=100')
-        g = next((g for g in gists if g.get('description') == GIST_DESC), None)
-        if not g: sys.exit('동기화 Gist(jiphoe-hub-sync)를 찾지 못했습니다. 앱에서 Gist 동기화를 먼저 연결하세요.')
-        gid = g['id']
     gh('/gists/' + gid, {'files': {GIST_FILE: {'content': payload}}}, 'PATCH')
     print(f'Gist에 저장했습니다: 파일 {len(files)}개')
 
