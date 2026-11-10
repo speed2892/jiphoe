@@ -263,11 +263,35 @@ def resolve(ref):
 
 def pages_text(z, pages, limit=12000):
     """EPUB 안의 면 표시(pageNum)를 따라 해당 면의 글만 꺼낸다"""
-    html = ''.join(z.read(n).decode('utf-8', 'replace') for n in spine(z))
+    return html_pages(''.join(z.read(n).decode('utf-8', 'replace') for n in spine(z)), pages, limit)
+
+WOL = 'https://wol.jw.org'
+_wol = {}
+def wol_get(path):
+    if path not in _wol:
+        _wol[path] = get(WOL + path, headers={'Accept-Language': 'ko', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36'}).decode('utf-8', 'replace')
+    return _wol[path]
+
+def wol_ref(ref, ch, pages):
+    """연구용 성경 장 페이지(연구 자료 찾아보기)에서 그 참조의 링크를 찾아 열고, 해당 면 글을 꺼낸다"""
+    page = wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{ch}')
+    links = {}
+    for m in re.finditer(r'<a [^>]*href="(/ko/wol/pc/[^"]+)"[^>]*>(.*?)</a>', page, re.S):
+        t = re.sub(r'<[^>]+>', '', m[2]); links[m[1]] = (links.get(m[1], '') + ' ' + t).strip()
+    key = lambda x: re.sub(r'[\s,]', '', x)
+    href = next((h for h, t in links.items() if key(t) == key(ref)), None) or next((h for h, t in links.items() if key(ref) in key(t) or key(t) in key(ref)), None)
+    if not href: return ''
+    html = wol_get(href)
+    body = html[html.find('<article'):] if '<article' in html else html
+    return html_pages(body, pages) if pages else ''
+
+def html_pages(html, pages, limit=12000):
     segs = re.split(r'<span[^>]*class="pageNum"[^>]*data-no="(\d+)"[^>]*>', html)
     want = set(pages); got = []
     for k in range(1, len(segs) - 1, 2):
         if int(segs[k]) in want: got.append(segs[k + 1])
+    # 글이 첫 면 표시 앞에서 시작하면(면 중간에서 시작한 기사) 그 앞부분은 첫 표시 바로 앞 면의 글이다
+    if len(segs) > 1 and (int(segs[1]) - 1) in want and re.sub(r'<[^>]+>|\s', '', segs[0]): got.insert(0, segs[0])
     if not got: return ''
     p = Text(); p.feed('<div><p>' + ''.join(got))
     return '\n\n'.join(l for l in p.lines() if l not in ('답을 적는 칸',))[:limit]
@@ -282,15 +306,21 @@ def handle_requests(gh, gid, gist):
         except Exception: return None
     reqs = read(REQ_FILE) or []
     have = read(REF_FILE) or {}
-    todo = [r for r in reqs if isinstance(r, str) and r not in have]
+    norm = [r if isinstance(r, dict) else {'ref': r} for r in reqs]
+    todo = [r for r in norm if r.get('ref') and (r['ref'] not in have or (not have[r['ref']].get('ok') and r.get('ch') and not have[r['ref']].get('wol')))]
     print(f'출판물 면 요청 {len(reqs)}개 (새로 {len(todo)}개)')
-    for ref in todo[:30]:
+    for rq in todo[:30]:
+        ref, ch = rq['ref'], rq.get('ch', '')
         try:
             code, issue, pages = resolve(ref)
             z = epub(code, issue) if code else None
             t = pages_text(z, pages) if z else ''
-            have[ref] = {'text': t, 'ok': bool(t), 'pub': code or '', 'issue': issue or '', 'at': dt.datetime.now(KST).isoformat(timespec='seconds')}
-            print(f"  {'✓' if t else '✗'} {ref[:40]} → {code} {issue} {pages[:3]} {len(t):,}자")
+            via = 'epub'
+            if not t and ch:
+                try: t = wol_ref(ref, ch, pages); via = 'wol'
+                except Exception as e: print(f'  wol 실패: {e.__class__.__name__} {getattr(e, "code", "")}')
+            have[ref] = {'text': t, 'ok': bool(t), 'pub': code or '', 'issue': issue or '', 'via': via, 'wol': bool(ch), 'at': dt.datetime.now(KST).isoformat(timespec='seconds')}
+            print(f"  {'✓' if t else '✗'} {ref[:40]} → {code} {issue} {pages[:3]} {via} {len(t):,}자")
         except Exception as e:
             have[ref] = {'text': '', 'ok': False, 'err': e.__class__.__name__}
             print(f'  ✗ {ref[:40]} ({e.__class__.__name__})')
