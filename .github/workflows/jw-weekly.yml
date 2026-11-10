@@ -1,0 +1,22 @@
+name: jw.org 주간 자료 받기
+on:
+  schedule:
+    - cron: '17 19 * * 0'   # 매주 월요일 새벽 4시 17분 (한국 시간)
+    - cron: '17 19 * * 3'   # 매주 목요일 새벽 4시 17분 (새 호가 늦게 올라온 경우 대비)
+  workflow_dispatch: {}      # Actions 화면에서 ‘Run workflow’로 바로 실행
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 이번 주와 다음 주 자료를 비공개 Gist에 넣기
+        env:
+          JW_GIST_TOKEN: ${{ secrets.JW_GIST_TOKEN }}
+          WEEKS: '4'
+        run: python tools/jw_weekly.py
