@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.2 (연구 노트도 GitHub에서)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.3 (성서 연구 참조 원문으로 답)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -999,7 +999,8 @@ function keywordsOfText(s, n=8){
 function extractPubRefs(text){
   /* 「예레」 165면 21항; 167면 25항 → 두 번째 것도 「예레」 167면 25항 으로 */
   const out = [], LOC = '(?:\\d+(?:-\\d+)?\\s*(?:면|과|장|항|단락|요점|부록\\s*[가-힣A-Z]?)\\s*,?\\s*)';
-  const re = new RegExp(`「([^」]{1,30})」\\s*(${LOC}*)((?:;\\s*${LOC}+)*)`, 'g'); let m;
+  const DATE = '(?:\\d{1,4}\\s*/\\s*\\d{1,2}(?:\\s*/\\s*\\d{1,2})?,?\\s*)?(?:제\\s*\\d\\s*권\\s*)?';
+  const re = new RegExp(`「([^」]{1,30})」\\s*(${DATE}${LOC}*)((?:;\\s*${DATE}${LOC}+)*)`, 'g'); let m;
   const add = r => { r = r.replace(/\s+/g,' ').replace(/[,;]\s*$/,'').trim(); if(!out.includes(r)) out.push(r); };
   const t = String(text||''); while((m = re.exec(t))){ add(`「${m[1]}」 ${m[2]||''}`); (m[3]||'').split(';').map(x=>x.trim()).filter(x=>/면|과|장|항/.test(x)).forEach(x=>add(`「${m[1]}」 ${x}`)); }
   return out;
@@ -1607,7 +1608,7 @@ async function importJWFiles(files){
     if(/집회교재/.test(name) || (!d && /성경에 담긴 보물/.test(text))){ res.weeks.push(...Weeks.parseWorkbook(text, name)); continue; }
     const wid = d ? Weeks.ymd(Weeks.monday(new Date(d+'T00:00:00'))) : null;
     if(/참조출판물\.json$/.test(name) && wid){ try{ const list = JSON.parse(text); Store.set('pubrefs', wid, list); res.pubrefs = (res.pubrefs||0)+list.length; }catch(e){} continue; }
-    if(/회중성서연구/.test(name) && wid){ const [ref, ...rest] = text.split('\n'); Store.set('cbs', wid, {ref:ref.trim(), text:rest.join('\n').trim(), ans:(Store.get('cbs', wid)||{}).ans||{}}); res.cbs = (res.cbs||0)+1; continue; }
+    if(/회중성서연구/.test(name) && wid){ const [ref, ...rest] = text.split('\n'); Store.set('cbs', wid, {ref:ref.trim(), text:rest.join('\n').trim(), doc:(name.match(/_(\d{7,})\.txt$/)||[])[1]||'', ans:(Store.get('cbs', wid)||{}).ans||{}}); res.cbs = (res.cbs||0)+1; continue; }
     if(/성경범위/.test(name) && wid){ Store.set('bible', wid, {range:(name.match(/성경범위_(.+)\.txt$/)||[])[1]||'', text}); res.bible++; continue; }
     if(wid){ const a = WT.parse(text); if(a.paras.length){ const old = Store.get('wt', wid); if(old && old.ans) a.ans = old.ans; Store.set('wt', wid, a); res.wt++; } }
   }
@@ -1759,16 +1760,30 @@ const CBS = {
 1. 답은 제공된 장 본문(성경 기록 이야기)과 성구 본문에서만 근거를 찾고, 없는 내용·인용을 지어내지 않습니다.
 2. 해설용 답은 자연스러운 한국어 구어체로 2-4문장(30초 이내)입니다. 핵심 요점을 먼저 말합니다.
 3. 성구는 꼭 필요할 때만 "사사기 4장 14절에서는 ~라고 말합니다"처럼 짧게 언급합니다.
-4. 질문에 「파15」 같은 출판물 참조가 붙어 있으면 제공된 '출판물 참조 본문'에서 답의 근거를 찾고 끝에 출처(예: 「파15」 8/1 12면)를 밝힙니다. 그 본문이 제공되지 않았으면 장 본문과 성구로 답한 뒤 "(자세한 내용: 「…」 참조)"라고만 덧붙입니다.
+4. 질문에 「파15」 같은 출판물 참조가 붙어 있고 그 원문이 제공되면, 답은 반드시 그 원문의 내용을 요약해 만들고 끝에 출처(예: 「파15」 8/1 12면)를 밝힙니다. 원문에 없는 말을 덧붙이지 않습니다.
+6. 외국어 단어를 섞지 말고 한국어로만 씁니다. 그 본문이 제공되지 않았으면 장 본문과 성구로 답한 뒤 "(자세한 내용: 「…」 참조)"라고만 덧붙입니다.
 5. 적용 질문(우리, 당신)에는 실생활 예를 한 가지 넣습니다.`,
+  /* 질문에 달린 「」 참조 → 받아 둔 원문 (교재 파일 안 원문 + GitHub가 받아 둔 면) */
+  citesFor(q, pool){
+    const refs = extractPubRefs(q); if(!refs.length) return {refs, found:[], missing:[]};
+    const key = r => String(r||'').replace(/[\s“”"'’‘(),]/g,'');
+    const sig = r => { const m = String(r||'').match(/「([^」]+)」\s*(.*?)(\d+)\s*(?:-\s*\d+\s*)?면/); return m ? m[1].replace(/\s/g,'')+'|'+m[2].replace(/\s/g,'')+'|'+m[3] : ''; };
+    const found = [], missing = [];
+    refs.forEach(r=>{ const hit = pool.find(x=>key(x.ref)===key(r)) || pool.find(x=>key(x.ref).includes(key(r)) || key(r).includes(key(x.ref))) || (sig(r) && pool.find(x=>sig(x.ref)===sig(r)));
+      if(hit) found.push({ref:r, text:hit.text}); else missing.push(r); });
+    return {refs, found, missing};
+  },
+  pool(id){ const a = (Store.get('pubrefs', id)||[]).map(x=>({ref:x.ref, text:x.text})); const h = JWRefs.all();
+    Object.keys(h).forEach(k=>{ if(!k.startsWith('study:') && h[k] && h[k].ok) a.push({ref:k, text:h[k].text}); }); return a; },
   material(c){ const cites = (c.cites||[]).map(x=>`## ${x.ref}\n${String(x.text).slice(0,6000)}`).join('\n\n');
     return `# 장: ${c.num} ${c.person} — ${c.title}\n# 이야기 본문\n${c.story.join('\n\n')}\n# 성구 본문\n${c.verses.join('\n')||'(없음)'}${cites ? `\n# 질문에 달린 출판물 참조 본문 (이 내용을 근거로 답할 수 있음)\n${cites}` : ''}`; },
   allPrompt(c){
-    const qs = c.groups.flatMap(g=>g.qs.map(q=>`### ${q.id} [${g.head}] ${q.q}`)).join('\n');
+    const qs = c.groups.flatMap(g=>g.qs.map(q=>{ const f = (q.cites||[]); return `### ${q.id} [${g.head}] ${q.q}` + (f.length ? `\n(이 질문의 참조 원문 — 이 내용으로 답할 것)\n${f.map(x=>`- ${x.ref}: ${String(x.text).slice(0,3000)}`).join('\n')}` : ''); })).join('\n');
     return `${this.material(c)}\n\n# 질문\n${qs}\n\n# 요청\n질문마다 해설용 답을 쓰십시오. 형식은 반드시 "### q번호" 줄 다음에 답만 쓰는 것입니다. 질문을 다시 적지 마십시오.`;
   },
   onePrompt(c, g, q, kind){
-    return `${this.material(c)}\n\n# 질문 [${g.head}]\n${q.q}\n\n# 요청\n${kind==='long' ? '이 질문에 대해 요점 3-4개를 들어 자세한 답(1분 분량)을 쓰십시오. 요점마다 근거가 되는 이야기 부분이나 성구를 밝히십시오.' : '이 질문에 해설용 답(2-4문장)을 쓰십시오.'} 답만 출력하십시오.`;
+    const f = q.cites||[];
+    return `${this.material(c)}\n\n# 질문 [${g.head}]\n${q.q}\n${f.length ? `\n# 이 질문에 달린 참조 출판물 원문 (답은 반드시 이 내용을 근거로)\n${f.map(x=>`## ${x.ref}\n${String(x.text).slice(0,6000)}`).join('\n\n')}\n` : ''}\n# 요청\n${kind==='long' ? '이 질문에 대해 요점 3-4개를 들어 자세한 답(1분 분량)을 쓰십시오. 요점마다 근거가 되는 이야기 부분이나 성구를 밝히십시오.' : '이 질문에 해설용 답(2-4문장)을 쓰십시오.'} 답만 출력하십시오.`;
   }
 };
 const VIEWS = [
@@ -2009,6 +2024,10 @@ const Views = {
       ${a.review.length ? `<div class="card" style="margin-top:14px"><h2>❓ 복습 질문</h2><ul class="plan">${a.review.map(q=>`<li><span class="ic">•</span><div>${esc(q)}</div></li>`).join('')}</ul></div>` : ''}
       <details class="more" style="margin-top:14px"><summary>다른 기사 불러오기·바꾸기</summary>${wolBtn}${imp}</details>`);
     bindImp();
+    const missAll = [...new Set(c.groups.flatMap(g=>g.qs.flatMap(q=>q.missing||[])))];
+    if(missAll.length && Sync.token() && !el.dataset.refsChecked){ el.dataset.refsChecked = 1;
+      JWRefs.load().then(()=>{ const pool = CBS.pool(id); if(missAll.some(r=>CBS.citesFor(r, pool).found.length)) render(); }).catch(()=>{}); }
+    if(missAll.length && Sync.token()){ JWRefs.request(missAll.map(ref=>({ref, doc:data.doc||''}))).then(()=>{ const st = $('#cbsSt'); if(st){ st.className='st'; st.textContent = `참조 출판물 ${missAll.length}개를 GitHub에 요청했습니다 — 몇 분 뒤(늦어도 1시간) 이 화면을 다시 여세요.`; } }).catch(()=>{}); }
     const saveAns = () => { const cur = Store.get('wt', id) || a; cur.ans = ans; Store.set('wt', id, cur); };
     $$('.qcard', el).forEach(card=>{
       const p = a.paras.find(x=>x.qn===card.dataset.qn); ans[p.qn] ||= {};
@@ -2043,7 +2062,8 @@ const Views = {
     const w = id ? Weeks.get(id) : null;
     const part = w && (w.parts||[]).find(p=>/회중 성서 연구/.test(p.title||''));
     const c = data ? CBS.parse(data.text) : null;
-    if(c) c.cites = (Store.get('pubrefs', id)||[]).filter(x=>x.where==='cbs');
+    if(c){ c.cites = (Store.get('pubrefs', id)||[]).filter(x=>x.where==='cbs'); const pool = CBS.pool(id);
+      c.groups.forEach(g=>g.qs.forEach(q=>{ const r = CBS.citesFor(q.q, pool); q.cites = r.found; q.missing = r.missing; })); }
     const head = `<section class="hero"><div class="kicker">${id ? esc(Weeks.labelOf(id))+' · ' : ''}회중 성서 연구${part && part.who ? ' · 사회 '+esc(part.who) : ''}</div><h1>${c ? esc(`${c.num}장 ${c.person}`) : '회중 성서 연구'}</h1><p>${c ? esc(c.title) : (part && part.sub ? esc(part.sub) : '연구 교재를 불러오면 질문마다 해설할 답을 준비할 수 있습니다.')}</p><div class="big">📘</div></section>`;
     const imp = `<div class="card"><h2>📥 연구 교재 불러오기</h2><p class="desc">보통은 <b>설정 → 동기화 → 📥 지금 불러오기</b>로 jw.org에서 자동으로 들어옵니다${part && part.sub ? ` (이번 주: ${esc(part.sub)})` : ''}. 직접 넣으려면 장 본문 전체를 붙여넣으세요.</p>
       <textarea data-act="cbsPaste" placeholder="16 바락과 드보라&#10;“내가 반드시 당신과 함께 가겠습니다”&#10;…"></textarea>
@@ -2065,7 +2085,7 @@ const Views = {
         .qcard .qh{font-weight:700} .qans{white-space:pre-line;background:var(--accent-soft);border-radius:10px;padding:10px 12px;margin-top:8px;font-size:.95rem}
         .qans b{display:block;font-size:.78rem;color:var(--accent);margin-bottom:2px} .story p{margin:0 0 10px;line-height:1.75}</style>
       <div class="card"><h2>🧭 ${esc(data.ref || '이번 주 연구')}</h2>
-        <p class="desc">이야기 ${c.story.length}문단 · 질문 ${total}개 · 성구 ${c.verses.length}개 · 참조 출판물 ${c.cites.length}개</p>
+        <p class="desc">이야기 ${c.story.length}문단 · 질문 ${total}개 · 성구 ${c.verses.length}개 · 질문의 참조 원문 ${c.groups.reduce((n,g)=>n+g.qs.reduce((m,q)=>m+(q.cites||[]).length,0),0)}개 확보</p>
         <div class="row"><button class="btn" id="cbsAll">💬 모든 질문 답 만들기</button><button class="btn danger" id="cbsStop" disabled>중지</button><button class="btn ghost" id="cbsCopy">답 모두 복사</button></div>
         <div class="st" id="cbsSt"></div>
         <details class="more"><summary>📖 이야기 본문 읽기</summary><div class="story" style="margin-top:10px">${c.story.map(t=>`<p>${esc(t)}</p>`).join('')}</div></details>
@@ -2075,6 +2095,8 @@ const Views = {
       </div>
       ${c.groups.map(g=>`<h3 style="margin:18px 4px 0;color:var(--accent)">▍${esc(g.head)}</h3>${g.qs.map(q=>{ const an = ans[q.id] || {}; return `<div class="qcard" data-q="${q.id}">
         <div class="qh">${esc(q.q)}</div>
+        ${(q.cites||[]).map(x=>`<details class="pd"><summary>📕 참조 원문 — ${esc(x.ref)}</summary><div style="max-height:40vh;overflow:auto;white-space:pre-line">${esc(x.text)}</div></details>`).join('')}
+        ${(q.missing||[]).length ? `<div class="desc">⏳ 참조 원문 받는 중: ${q.missing.map(esc).join(', ')}</div>` : ''}
         ${an.a ? `<div class="qans"><b>해설용 답</b>${esc(an.a)}</div>` : ''}${an.long ? `<div class="qans"><b>자세히</b>${esc(an.long)}</div>` : ''}
         <div class="row"><button class="btn sm" data-k="a">${an.a ? '다시 만들기' : '답 만들기'}</button><button class="btn sm ghost" data-k="long">자세히</button></div>
         <label>내 해설 메모</label><textarea data-k="mine" style="min-height:60px" placeholder="내가 말할 해설을 적어 두세요.">${esc(an.mine||'')}</textarea></div>`; }).join('')}`).join('')}
