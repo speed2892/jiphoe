@@ -7,7 +7,7 @@
 """
 import io, json, os, re, sys, zipfile, datetime as dt
 from html.parser import HTMLParser
-import urllib.request
+import urllib.request, urllib.parse
 
 KST = dt.timezone(dt.timedelta(hours=9))
 API = 'https://b.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS?output=json&pub={pub}{issue}&fileformat=EPUB&alllangs=0&langwritten=KO&txtCMSLang=KO'
@@ -20,6 +20,18 @@ def get(url, data=None, headers=None, method=None):
         return r.read()
 
 _cache = {}
+_titles = {}
+def week_titles(pub, issue):
+    """주별 RTF 파일 제목 목록 (예: '11월 9-15일 (예레미야 51-52장)') — 성경 읽기 범위를 알아내는 데 쓴다"""
+    key = (pub, issue)
+    if key not in _titles:
+        try:
+            j = json.loads(get(API.format(pub=pub, issue=f'&issue={issue}').replace('fileformat=EPUB', 'fileformat=RTF')))
+            _titles[key] = [x.get('title', '') for x in j['files']['KO']['RTF']]
+        except Exception: _titles[key] = []
+    return _titles[key]
+
+RANGE = re.compile(r'([가-힣]+(?:\s[가-힣]+)?\s\d{1,3}(?:\s*[-–]\s*\d{1,3})?\s*장)')
 def epub(pub, issue=''):
     key = (pub, issue)
     if key in _cache: return _cache[key]
@@ -100,8 +112,16 @@ def find_workbook(monday):
             head = ' '.join(ls[:2])
             mt = re.match(r'\s*(\d{1,2})월\s*(\d{1,2})일?\s*[-–~]', head)
             if mt and (int(mt[1]), int(mt[2])) == md(monday) and any('성경에 담긴 보물' in l for l in ls):
-                return ls
-    return None
+                rng = ''
+                for t in week_titles('mwb', iss):
+                    t2 = re.match(r'\s*(\d{1,2})월\s*(\d{1,2})', t)
+                    if t2 and (int(t2[1]), int(t2[2])) == md(monday) and RANGE.search(t): rng = RANGE.search(t)[1]; break
+                if not rng:
+                    for l in ls[:30]:
+                        if RANGE.search(l): rng = RANGE.search(l)[1]; break
+                print('  교재 첫 줄:', ' / '.join(x[:24] for x in ls[:5]))
+                return ls, rng
+    return None, ''
 
 def find_wt(monday):
     """이번 주 파수대 연구 기사: 앞부분에 'YYYY년 M월 D-…일' 이 있는 문서"""
@@ -143,6 +163,42 @@ def bible_text(rng):
         out.append(f'[{book} {c}장]'); out.append(book); out.extend(ls)
     return '\n'.join(out)
 
+# 회중 성서 연구 교재: 「약호」 → 출판물 기호 (모르면 jw.org 검색으로 찾는다)
+PUB_ABBR = {'용하': 'wcg'}
+def pub_code(abbr):
+    if abbr in PUB_ABBR: return PUB_ABBR[abbr]
+    try:
+        tok = get('https://b.jw-cdn.org/tokens/jworg.jwt').decode().strip()
+        j = json.loads(get('https://b.jw-cdn.org/apis/search/results/KO/publications?q=' + urllib.parse.quote(abbr) + '&limit=5',
+                           headers={'Authorization': 'Bearer ' + tok}))
+        items = []
+        def walk(n):
+            if n.get('type') == 'item': items.append(n)
+            for c in n.get('results', []) or []: walk(c)
+        walk({'results': j.get('results', [])})
+        for it in items:
+            lank = it.get('lank', '')
+            if lank.startswith('pub-'): PUB_ABBR[abbr] = lank[4:]; return lank[4:]
+    except Exception as e: print('  출판물 기호 찾기 실패:', abbr, e.__class__.__name__)
+    return None
+
+def find_cbs(wb):
+    """교재의 '회중 성서 연구' 순서에서 「약호」 N장(과) 을 찾아 그 장 본문을 가져온다"""
+    i = next((k for k, l in enumerate(wb) if '회중 성서 연구' in l), None)
+    if i is None: return None
+    ref = next((l for l in wb[i:i+4] if '「' in l), '')
+    mt = re.search(r'「([^」]+)」\s*(\d{1,3})\s*(장|과)', ref)
+    if not mt: print('  회중 성서 연구 참조 못 찾음'); return None
+    abbr, num = mt[1], int(mt[2])
+    code = pub_code(abbr)
+    z = epub(code) if code else None
+    if not z: return None
+    for n in spine(z):
+        p = doc(z, n)
+        if re.match(rf'\s*{num}(\s|$)', p.title or '') or re.match(rf'\s*{num}\s*(장|과)', p.title or ''):
+            return {'ref': ref.strip(), 'title': (p.title or '').strip(), 'text': '\n\n'.join(p.lines())}
+    print('  회중 성서 연구 장을 못 찾음:', abbr, num); return None
+
 def safe(s): return re.sub(r'[\\/:*?"<>|“”‘’]', '', s).strip()[:60]
 
 def main():
@@ -155,14 +211,15 @@ def main():
     for i in range(weeks):
         mon = mon0 + dt.timedelta(weeks=i); wid = mon.isoformat()
         print(f'{wid} 주')
-        wb = find_workbook(mon)
+        wb, rng = find_workbook(mon)
         if wb:
             label = wb[0].split('(')[0].strip()
-            files.append({'name': f'{wid}_집회교재_{safe(label)}.txt', 'text': '\n\n'.join(wb)})
-            rng = ''
-            for l in wb[:4]:
-                mt = re.search(r'([가-힣]+(?:\s[가-힣]+)?\s\d{1,3}(?:\s*[-–]\s*\d{1,3})?\s*장)', l)
-                if mt: rng = mt[1].strip(); break
+            # 앱이 읽기 좋은 모양으로: 첫 줄 주 표시, 둘째 줄 성경 읽기 범위, 그다음 '노래…'부터 본문
+            i = next((k for k, l in enumerate(wb) if l.startswith('노래')), 1)
+            body = [label] + ([rng] if rng else []) + wb[i:]
+            files.append({'name': f'{wid}_집회교재_{safe(label)}.txt', 'text': '\n\n'.join(body)})
+            cbs = find_cbs(wb)
+            if cbs: files.append({'name': f"{wid}_회중성서연구_{safe(cbs['ref'])}.txt", 'text': f"{cbs['ref']}\n{cbs['title']}\n\n{cbs['text']}"})
             bt = bible_text(rng) if rng else None
             if bt: files.append({'name': f'{wid}_성경범위_{safe(rng)}.txt', 'text': bt})
             else: print(f'  성경 범위 못 찾음: {rng!r}')
