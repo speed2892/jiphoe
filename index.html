@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.5 (Claude 무료 답 자동 넣기)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.0 (이번 주 전체 한 번에)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1815,6 +1815,75 @@ const CBS = {
     return `${this.material(c)}\n\n# 질문 [${g.head}]\n${q.q}\n${f.length ? `\n# 이 질문에 달린 참조 출판물 원문 (답은 반드시 이 내용을 근거로)\n${f.map(x=>`## ${x.ref}\n${String(x.text).slice(0,6000)}`).join('\n\n')}\n` : ''}\n# 요청\n${kind==='long' ? '이 질문에 대해 요점 3-4개를 들어 자세한 답(1분 분량)을 쓰십시오. 요점마다 근거가 되는 이야기 부분이나 성구를 밝히십시오.' : '이 질문에 해설용 답(2-4문장)을 쓰십시오.'} 답만 출력하십시오.`;
   }
 };
+/* =========================================================
+   이번 주 전체를 한 번에: 모든 연설·실연·영적 보물·토의(동영상)·회중 성서 연구를
+   하나의 요청 글로 묶어 Claude 채팅에 보내고, 받은 결과를 순서마다 나눠 넣는다
+   ========================================================= */
+const Bundle = {
+  cap: (t, n) => { t = String(t||''); return t.length > n ? t.slice(0, n) + '\n…(줄임)' : t; },
+  partMat(id, p){
+    const key = `week:${id}#${p.no}`; let mat = Research.materialText(key);
+    const loc = Research.localPubRefs(extractPubRefs([p.sub, p.detail].join('\n')), id).found
+      .filter(x=>!mat.includes(String(x.text).slice(0, 40)));
+    if(loc.length) mat += '\n[교재가 가리킨 출판물 원문]\n' + loc.map(x=>`${x.title}\n${this.cap(x.text, 2500)}`).join('\n\n');
+    return this.cap(mat, 7000);
+  },
+  async build(id){
+    const w = Weeks.get(id); if(!w) throw new Error('이 주의 교재가 없습니다.');
+    const secs = [], plan = [];
+    for(const p of (w.parts||[])){
+      const kind = Practice.kind(p), vids = JWVideo.titlesIn(p.detail);
+      if(kind==='gems'){
+        const bible = Store.get('bible', id);
+        secs.push(`=== [G] === (${p.no}. ${p.title})\n` + Gems.prompt(w, p, bible && this.cap(bible.text, 9000), this.cap(Research.materialText(`gems:${id}`) || this.partMat(id, p), 7000)));
+        plan.push(`[G] ${p.no}. ${p.title}: 해설 답변과 영적 보물`);
+      } else if(vids.length || (kind==='life' && JWVideo.questionsIn(p.detail).length)){
+        const vv = (await Promise.all(vids.map(t=>JWVideo.get(t).catch(()=>null)))).filter(Boolean);
+        const qs = JWVideo.questionsIn(p.detail);
+        secs.push(`=== [L${p.no}] === (${p.no}. ${p.title})\n` + JWVideo.prompt(p, vv, qs, this.partMat(id, p)));
+        plan.push(`[L${p.no}] ${p.no}. ${p.title}: 질문 ${qs.length}개의 답 ("### Q1"… 형식)`);
+      } else if(kind==='reading' || /회중 성서 연구/.test(p.title||'')){
+        continue;
+      } else {
+        secs.push(`=== [P${p.no}] === (${p.no}. ${p.title}, ${p.min}분)\n` + Practice.scriptPrompt(w, p, kind, this.partMat(id, p)));
+        plan.push(`[P${p.no}] ${p.no}. ${p.title}: ${kind==='demo' ? '실연 대본' : kind==='life' ? '진행 메모' : '연설문'}`);
+      }
+    }
+    const cb = Store.get('cbs', id);
+    if(cb){ const c = CBS.parse(cb.text); const pool = CBS.pool(id);
+      c.cites = (Store.get('pubrefs', id)||[]).filter(x=>x.where==='cbs');
+      c.groups.forEach(g=>g.qs.forEach(q=>{ q.cites = CBS.citesFor(q.q, pool).found; }));
+      secs.push(`=== [C] === (회중 성서 연구 ${cb.ref||''})\n` + CBS.allPrompt(c));
+      plan.push(`[C] 회중 성서 연구: 질문 ${c.groups.reduce((n,g)=>n+g.qs.length,0)}개의 답 ("### q1"… 형식)`); }
+    const rules = `당신은 여호와의 증인 평일 집회(생활과 봉사) 전체를 준비하는 사람을 돕습니다. 아래에 순서별 자료와 요청이 '=== [ID] ===' 구역으로 나뉘어 있습니다.
+# 공통 규칙
+${Practice.rules}
+# 영적 보물 찾기 규칙
+${Gems.rules}
+# 토의(동영상) 규칙
+${JWVideo.rules}
+# 회중 성서 연구 규칙
+${CBS.rules}
+# 출력 형식 (반드시 지킬 것)
+구역마다 첫 줄에 '=== [ID] ===' 를 그대로 쓰고 그 아래에 결과만 씁니다. 순서는 아래 목록과 같게 하고, 설명·인사말은 쓰지 않습니다.
+${plan.map(x=>'- '+x).join('\n')}`;
+    return {text: `${rules}\n\n${secs.join('\n\n')}\n\n# 다시 한 번: 위 목록의 모든 구역을 '=== [ID] ===' 형식으로 빠짐없이 출력하십시오.`, plan};
+  },
+  apply(id, txt){
+    const parts = String(txt||'').replace(/\r/g,'').split(/^\s*={2,}\s*\[([A-Z]\d*)\]\s*={2,}.*$/m); let n = 0;
+    const qsplit = (body, re) => { const o = {}; body.split(re).forEach((x,i,a)=>{ if(i%2===1){ const b = (a[i+1]||'').replace(/\*\*/g,'').trim(); if(b) o[x] = b; } }); return o; };
+    for(let i=1; i<parts.length; i+=2){
+      const tag = parts[i], body = (parts[i+1]||'').trim(); if(!body) continue;
+      if(tag==='G'){ Store.set('gems', id, {...(Store.get('gems', id)||{}), out:body}); n++; }
+      else if(/^P\d+$/.test(tag)){ const k = `${id}#${tag.slice(1)}`; Store.set('practice', k, {...(Store.get('practice', k)||{}), script:body}); n++; }
+      else if(/^L\d+$/.test(tag)){ const lv = {}; const o = qsplit(body, /^\s*(?:#{1,4}\s*)?\**\s*Q(\d+)[.:)\s]*\**/m); Object.keys(o).forEach(q=>lv['Q'+q] = o[q]);
+        const k = `${id}#${tag.slice(1)}`; Store.set('practice', k, {...(Store.get('practice', k)||{}), lv}); n++; }
+      else if(tag==='C'){ const cb = Store.get('cbs', id); if(cb){ const o = qsplit(body, /^\s*(?:#{1,4}\s*)?\**\s*q(\d+)[.:)\s]*\**/mi); const ans = cb.ans || {};
+        Object.keys(o).forEach(q=>{ ans['q'+q] = {...(ans['q'+q]||{}), a:o[q]}; }); Store.set('cbs', id, {...cb, ans}); n++; } }
+    }
+    return n;
+  }
+};
 const VIEWS = [
   {id:'week',   icon:'🏠', title:'이번 주',     short:'이번 주'},
   {id:'wt',     icon:'📖', title:'파수대 연구', short:'파수대'},
@@ -1900,7 +1969,8 @@ const Views = {
                     : `<div class="pt"><b>${p.no}. ${esc(p.title)||'<span style=\'color:var(--muted)\'>(제목 없음)</span>'}</b> <span class="badge" style="background:var(--s);color:var(--c)">${p.min||'-'}분</span>${me?' <span class="badge ok">내 과제</span>':''}</div>${p.sub?`<div class="ps">${esc(p.sub)}</div>`:''}`}
           ${p.detail && !editing ? `<details class="pd"><summary>교재 내용 보기</summary><div>${esc(p.detail).replace(/\n/g,'<br>')}</div></details>` : ''}
           ${(()=>{ const c = !editing && /회중 성서 연구/.test(p.title||'') && Store.get('cbs', w.id); return c ? `<a class="btn ghost sm" href="#cbs" style="margin-top:6px">📘 연구 교재·질문 답 보기</a>` : ''; })()}
-          ${!editing && JWVideo.titlesIn(p.detail).length ? `<button class="btn ghost sm" data-golv="${p.no}" data-wid="${w.id}" style="margin-top:6px">🎬 동영상·토의 질문 답 보기</button>` : ''}
+          ${!editing && JWVideo.titlesIn(p.detail).length ? `<button class="btn ghost sm" data-golv="${p.no}" data-wid="${w.id}" style="margin-top:6px">🎬 동영상·토의 질문 답 보기</button>`
+            : (!editing && /연설|대화|관심|제자|설명|낭독/.test(p.title||'') && !/회중 성서 연구/.test(p.title||'') && Practice.kind(p)!=='gems' ? `<button class="btn ghost sm" data-golv="${p.no}" data-wid="${w.id}" style="margin-top:6px">✍️ ${/낭독/.test(p.title)?'낭독 연습':/연설/.test(p.title)?'연설문 만들기':'실연 원고 만들기'}</button>` : '')}
         </div>
         <input type="text" class="who" data-f="who" list="nameList" value="${esc(p.who)}" placeholder="${p.sec==='ministry' && !/연설/.test(p.title) ? '학생 / 보조자' : '맡은 사람'}">
       </div>`;
@@ -1930,6 +2000,7 @@ const Views = {
         <button class="btn ghost sm" id="wNext" ${i>=ids.length-1?'disabled':''} aria-label="다음 주">▶</button>
         ${!isThis ? '<button class="btn ghost sm" id="wToday">이번 주로</button>' : ''}
         <button class="btn sm" id="wPrint">🖨 순서지 인쇄</button>
+        <button class="btn sm" id="wAll">🗂️ 이번 주 전체 Claude로</button>
         <button class="btn ghost sm" id="wEdit">${editing ? '✔ 편집 끝' : '✎ 순서 편집'}</button>
       </div>
       ${mine.length ? `<div class="mybar">🙋 이번 주 내 과제: ${mine.join(' · ')}</div>` : ''}
@@ -1978,6 +2049,28 @@ const Views = {
     $('#wPrev').onclick = ()=>go(ids[i-1]); $('#wNext').onclick = ()=>go(ids[i+1]);
     if($('#wToday')) $('#wToday').onclick = ()=>go(Weeks.thisId());
     $('#wPrint').onclick = ()=>Weeks.print(w);
+    /* 이번 주 전체를 한 번에 Claude로 */
+    let allWaiting = '';
+    const allBack = async () => { if(!allWaiting || document.visibilityState!=='visible') return;
+      try{ const t = await navigator.clipboard.readText(); if(t && /===\s*\[[A-Z]\d*\]\s*===/.test(t) && !t.startsWith(allWaiting)){ const n = Bundle.apply(w.id, t); if(n){ allWaiting = ''; toast(`Claude 결과 ${n}개 구역을 순서마다 넣었습니다.`); render(); } } }catch(e){} };
+    $('#wAll').onclick = async ()=>{
+      const b = $('#wAll'); b.disabled = true; b.textContent = '자료 모으는 중…';
+      try{ const {text, plan} = await Bundle.build(w.id);
+        let ok = true; try{ await navigator.clipboard.writeText(text); }catch(e){ ok = false; }
+        window.open('https://claude.ai/new', '_blank', 'noopener'); allWaiting = text.slice(0, 80);
+        document.addEventListener('visibilitychange', ()=>setTimeout(allBack, 400)); window.addEventListener('focus', ()=>setTimeout(allBack, 400));
+        const box = document.createElement('div'); box.className = 'card';
+        box.innerHTML = `<h2>🗂️ 이번 주 전체를 Claude로</h2><p class="desc">${ok ? `요청 글(${text.length.toLocaleString()}자, ${plan.length}개 구역)을 복사하고 Claude를 열었습니다.` : '자동 복사가 안 되었습니다.'} Claude 입력칸을 길게 눌러 <b>붙여넣기</b> → 보내기. 답이 끝나면 <b>답 전체를 복사</b>해서 돌아오면 순서마다 자동으로 들어갑니다.</p>
+          <ul class="desc">${plan.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+          <div class="row"><button class="btn ghost" id="wAllPaste">📥 Claude 결과 넣기</button><button class="btn ghost" id="wAllCopy">📋 요청 글 다시 복사</button></div>
+          <textarea id="wAllBox" placeholder="자동으로 안 되면 Claude 답 전체를 여기에 붙여넣고 ‘Claude 결과 넣기’를 누르세요." style="min-height:90px"></textarea><div class="st" id="wAllSt"></div>`;
+        el.querySelector('.wkbar').after(box);
+        $('#wAllCopy').onclick = async ()=>{ try{ await navigator.clipboard.writeText(text); toast('요청 글을 복사했습니다.'); }catch(e){ $('#wAllBox').value = text; } };
+        $('#wAllPaste').onclick = async ()=>{ let t = $('#wAllBox').value.trim(); if(!t){ try{ t = await navigator.clipboard.readText(); }catch(e){} }
+          const n = Bundle.apply(w.id, t); const st = $('#wAllSt');
+          if(n){ toast(`Claude 결과 ${n}개 구역을 순서마다 넣었습니다.`); render(); } else { st.className='st err'; st.textContent = "'=== [P1] ===' 같은 구역 표시를 찾지 못했습니다. Claude 답 전체를 복사해 주세요."; } };
+      }catch(e){ toast('오류: '+e.message); }
+      b.disabled = false; b.textContent = '🗂️ 이번 주 전체 Claude로'; };
     $('#wEdit').onclick = ()=>{ if(editing) delete el.dataset.edit; else el.dataset.edit = '1'; Weeks.save(w); render(); };
     if($('#pAdd')) $('#pAdd').onclick = ()=>{ const last = w.parts[w.parts.length-1]; w.parts.push({no:w.parts.length+1, sec:last?last.sec:'life', title:'', min:5, sub:'', detail:'', who:''}); Weeks.save(w); render(); };
     if($('#wDel')) $('#wDel').onclick = e=>{ const b = e.currentTarget; if(!b.dataset.arm){ b.dataset.arm = 1; b.textContent = '한 번 더 누르면 삭제'; setTimeout(()=>{ delete b.dataset.arm; b.textContent='이 주 삭제'; }, 3000); return; }
@@ -2227,8 +2320,8 @@ const Views = {
       <div class="card"><h2>📝 ${kind==='demo' ? '실연 예시 대본' : kind==='reading' ? '낭독 연습 도움말' : kind==='life' ? '진행 메모' : '연설문'}</h2>
         <p class="desc">이번 주 화면에서 이 순서를 자료 조사해 두었다면 체크한 자료가 함께 쓰입니다.</p>
         <div class="row" style="margin-top:0"><button class="btn" id="prGo">✍️ 만들기</button><button class="btn danger" id="prStop" disabled>중지</button><button class="btn ghost" id="prCopy">복사</button></div>
-        <div class="row"><button class="btn ghost" id="prAsk">📋 요청 글 복사</button><a class="btn ghost" href="https://claude.ai/new" target="_blank" rel="noopener">💬 Claude 열기</a><button class="btn ghost" id="prPaste">📥 결과 붙여넣기</button></div>
-        <p class="desc" style="margin-top:4px">무료로 쓰기: ① 요청 글 복사 → ② Claude 채팅에 붙여넣고 보내기 → ③ 나온 연설문을 복사해 ‘결과 붙여넣기’ (API 키 필요 없음)</p>
+        <div class="row"><button class="btn ghost" id="prAsk">📋 Claude에서 무료로 만들기</button><button class="btn ghost" id="prPaste">📥 Claude 원고 넣기</button></div>
+        <p class="desc" style="margin-top:4px">무료: ① ‘Claude에서 무료로 만들기’ → Claude가 열리면 보내기(요청 글이 안 보이면 길게 눌러 붙여넣기) → ② 나온 원고를 복사 → ③ 앱으로 돌아오면 원고가 자동으로 들어갑니다(안 되면 ‘Claude 원고 넣기’).</p>
         <div class="st" id="prSt"></div>
         <textarea id="prScript" style="min-height:240px;margin-top:10px" placeholder="만든 내용이 여기에 나옵니다. 직접 고칠 수 있습니다.">${esc(pr.script||'')}</textarea></div>
       <div class="card"><h2>⏱️ 말하기 연습</h2>
@@ -2310,9 +2403,20 @@ const Views = {
         ? `\n\n# 먼저 할 일\n웹 검색으로 wol.jw.org(온라인 라이브러리)에서 다음 출판물 참조를 찾아, 그 면·항의 요점을 자신의 말로 간추려 연설에 반영하십시오: ${prPubs.join(' / ')}\n찾지 못한 참조는 제목만 언급하고 내용을 지어내지 마십시오.`
         : '';
       const txt = `${Practice.rules}\n\n${Practice.scriptPrompt(w, p, kind, mat + (readTxt ? `\n[낭독 본문]\n${readTxt}` : ''))}${extra}\n\n# 출력\n설명 없이 ${Practice.label[kind]} 원고만 출력하십시오.`;
-      const st = $('#prSt');
-      try{ await navigator.clipboard.writeText(txt); st.className='st ok'; st.textContent = `요청 글을 복사했습니다 (${txt.length.toLocaleString()}자). ‘💬 Claude 열기’를 눌러 채팅에 붙여넣고 보내세요.`; }
-      catch(e){ sc.value = txt; sc.select(); st.className='st'; st.textContent = '자동 복사가 안 되어 아래 칸에 넣었습니다. 전체 선택해 복사하세요.'; } };
+      const st = $('#prSt'); let copied = true;
+      try{ await navigator.clipboard.writeText(txt); }catch(e){ copied = false; }
+      const enc = encodeURIComponent(txt);
+      window.open(enc.length < 14000 ? 'https://claude.ai/new?q='+enc : 'https://claude.ai/new', '_blank', 'noopener');
+      prWaiting = txt.slice(0, 200); st.className = copied ? 'st ok' : 'st';
+      st.textContent = copied ? `요청 글을 복사하고 Claude를 열었습니다 (${txt.length.toLocaleString()}자). 입력칸이 비어 있으면 길게 눌러 붙여넣고 보내세요. 원고를 복사해 돌아오면 자동으로 들어갑니다.`
+        : 'Claude를 열었습니다. 자동 복사가 안 되어 요청 글이 들어가지 않았다면 다시 시도해 주세요.'; };
+    /* Claude에서 원고를 복사해 앱으로 돌아오면 자동으로 넣기 (요청 글 자체는 넣지 않음) */
+    let prWaiting = '';
+    const prBack = async () => { if(!prWaiting || document.visibilityState!=='visible' || !$('#prSt')) return;
+      try{ const t = (await navigator.clipboard.readText()||'').trim();
+        if(t && t.length > 80 && !t.startsWith(prWaiting.slice(0, 60))){ prWaiting = ''; sc.value = t; save({script:t});
+          const st = $('#prSt'); st.className='st ok'; st.textContent = `Claude 원고를 넣었습니다 — 약 ${t.length.toLocaleString()}자 (≈${(t.length/330).toFixed(1)}분)`; toast('Claude 원고를 넣었습니다.'); } }catch(e){} };
+    document.addEventListener('visibilitychange', ()=>setTimeout(prBack, 400)); window.addEventListener('focus', ()=>setTimeout(prBack, 400));
     $('#prPaste').onclick = async ()=>{ const st = $('#prSt');
       try{ const t = (await navigator.clipboard.readText()||'').trim(); if(!t) throw new Error('empty');
         sc.value = t; save({script:t}); st.className='st ok'; st.textContent = `붙여넣었습니다 — 약 ${t.length.toLocaleString()}자 (≈${(t.length/330).toFixed(1)}분)`; }
