@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.0 (연구 자료 찾아보기 면 가져오기)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.9.1 (오래된 출판물은 온라인 라이브러리에서)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1020,11 +1020,15 @@ const JWRefs = {
     });
     return [...new Set(out)];
   },
+  /* refs: '「통찰」 제1권 785면' 또는 {ref, ch:'24/51'} (ch = 연구용 성경 책/장 — 공식 파일에 없을 때 온라인 라이브러리에서 찾는 데 씀) */
   async request(refs){
     if(!refs.length || !Sync.token()) return false;
     let cur = []; try{ cur = JSON.parse(await Sync.readFile('jw-requests.json') || '[]'); }catch(e){}
-    const next = [...new Set([...cur, ...refs])]; if(next.length === cur.length) return true;
-    await Sync.writeFile('jw-requests.json', JSON.stringify(next.slice(-300)));
+    const norm = x => typeof x==='string' ? {ref:x} : x, k = x => norm(x).ref+'@'+(norm(x).ch||'');
+    const map = new Map(cur.map(x=>[k(x), norm(x)])); const n0 = map.size;
+    refs.forEach(x=>{ const v = norm(x); map.delete(v.ref+'@'); map.set(k(v), v); });
+    if(map.size === n0 && refs.every(x=>cur.some(c=>k(c)===k(x)))) return true;
+    await Sync.writeFile('jw-requests.json', JSON.stringify([...map.values()].slice(-300)));
     /* 바로 받아 오도록 GitHub 작업을 깨워 본다 (토큰에 권한이 없으면 1시간 안에 자동으로 돈다) */
     try{ const [owner] = location.hostname.split('.'); const repo = location.pathname.split('/').filter(Boolean)[0] || 'jiphoe';
       await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/jw-weekly.yml/dispatches`, {method:'POST',
@@ -1032,12 +1036,13 @@ const JWRefs = {
     return true;
   },
   /* 받아 둔 면 → 조사 항목, 아직 없는 것 → 요청 */
-  async items(refs){
-    const have = await this.load(), found = [], missing = [];
-    refs.forEach(r=>{ const h = have[r]; if(h && h.ok) found.push({id:'ref-'+r, kind:'pub', title:r, source:'출판물 (jw.org 공식 파일)', text:h.text, link:'', checked:true});
-      else if(!h) missing.push(r); });
+  async items(reqs){
+    const have = await this.load(), found = [], missing = [], failed = [];
+    reqs.forEach(q=>{ const r = typeof q==='string' ? q : q.ref, h = have[r];
+      if(h && h.ok) found.push({id:'ref-'+r, kind:'pub', title:r, source:h.via==='wol' ? '출판물 (jw.org 온라인 라이브러리)' : '출판물 (jw.org 공식 파일)', text:h.text, link:'', checked:true});
+      else if(!h || (!h.wol && q.ch)) missing.push(q); else failed.push(r); });
     if(missing.length) await this.request(missing).catch(()=>{});
-    return {found, missing, failed:refs.filter(r=>have[r] && !have[r].ok)};
+    return {found, missing, failed};
   }
 };
 const Research = {
@@ -1166,7 +1171,10 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
     /* 연구 노트의 '연구 자료 찾아보기'와 원문을 못 찾은 교재 참조 → GitHub가 받아 둔 면을 붙이거나 요청 */
     if(Sync.token()){
       const local = ctx && ctx.weekId ? this.localPubRefs(pubs, ctx.weekId) : {found:[], missing:pubs};
-      const want = [...new Set([...out.filter(i=>i.kind==='study').flatMap(i=>JWRefs.parse(i.text)), ...local.missing.filter(r=>/면/.test(r))])];
+      const chOf = t => { const m = String(t||'').match(/^(.+?)\s(\d{1,3}):/); const bn = m && bookNo(m[1]); return bn ? `${bn}/${m[2]}` : ''; };
+      const seen = new Set(), want = [];
+      [...out.filter(i=>i.kind==='study').flatMap(i=>JWRefs.parse(i.text).map(ref=>({ref, ch:chOf(i.title)}))), ...local.missing.filter(r=>/면/.test(r)).map(ref=>({ref}))]
+        .forEach(q=>{ if(!seen.has(q.ref)){ seen.add(q.ref); want.push(q); } });
       if(want.length){ onStatus && onStatus('참조 출판물 면 확인 중…');
         try{ const r = await JWRefs.items(want); const got = new Set(r.found.map(f=>this.pubKey(f.title)));
           for(let k = out.length-1; k>=0; k--){ if(out[k].kind==='pub' && got.has(this.pubKey(String(out[k].title).split(' — ')[0]))) out.splice(k,1); }
