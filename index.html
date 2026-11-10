@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.7.7 (자료 선택 수 바로 표시)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.0 (jw.org 주간 자료 자동 받기)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -314,8 +314,15 @@ const Sync = (()=>{
   Store.on(info => { if(info.local && token()){ clearTimeout(pushTimer); pushTimer = setTimeout(now, 2500); } });
   document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && token()) now(); });
   setInterval(()=>{ if(document.visibilityState==='visible' && token()) now(); }, 90*1000);
+  /* 같은 Gist 안의 다른 파일 읽기 (jw-weekly.json 등) */
+  async function readFile(name){
+    if(!token()) return null;
+    const g = await (await gh('/gists/'+await gistId())).json();
+    const f = g.files && g.files[name]; if(!f) return null;
+    return (f.truncated && f.raw_url) ? await (await fetch(f.raw_url)).text() : f.content;
+  }
   return {
-    now, token,
+    now, token, readFile,
     status(){ return {state, lastAt, err:lastErr}; },
     async connect(tok){
       Settings.set('ghToken', tok.trim()); Settings.set('gistId', null);
@@ -1455,6 +1462,27 @@ const Gems = {
   }
 };
 /* D:\JW 파일 이름으로 종류 나누기: …_집회교재_… / …_성경범위_… / 그 밖의 날짜 파일 = 파수대 연구 기사 */
+/* jw.org 주간 자료 자동 받기
+   GitHub Actions(.github/workflows/jw-weekly.yml)가 매주 jw.org 공식 EPUB에서 집회 교재·파수대 연구 기사·성경 읽기 범위를 글로 바꿔
+   비공개 동기화 Gist의 jw-weekly.json 에 넣어 둔다. 앱은 열릴 때 그것을 읽어 채운다. */
+const JWAuto = {
+  status(){ return Settings.get('jwAuto', null); },
+  async load({force=false, quiet=true} = {}){
+    if(!Sync.token()) { if(!quiet) toast('먼저 설정에서 Gist 동기화를 연결해 주세요.'); return null; }
+    try{
+      const raw = await Sync.readFile('jw-weekly.json');
+      if(!raw){ if(!quiet) toast('아직 받은 자료가 없습니다. GitHub Actions에서 ‘Run workflow’를 한 번 눌러 주세요.'); return null; }
+      const j = JSON.parse(raw); const prev = this.status();
+      if(!force && prev && prev.generated===j.generated) return prev;
+      const files = (j.files||[]).map(f=>({name:f.name, text:async()=>f.text}));
+      const r = await importJWFiles(files); r.weeks.forEach(w=>Weeks.mergeInto(w));
+      const st = {generated:j.generated, at:Date.now(), weeks:r.weeks.length, wt:r.wt, bible:r.bible};
+      Settings.set('jwAuto', st);
+      toast(`jw.org 자료를 받았습니다 — 교재 ${r.weeks.length}주 · 파수대 ${r.wt}개 · 성경 범위 ${r.bible}개`);
+      render(); return st;
+    }catch(e){ if(!quiet) toast('jw.org 자료를 읽지 못했습니다: '+(e.message||e)); return null; }
+  }
+};
 async function importJWFiles(files){
   const res = {weeks:[], wt:0, bible:0};
   for(const f of files){
@@ -2187,6 +2215,8 @@ const Views = {
         <div class="note">서로 다른 기기에서 같은 항목을 같은 시각에 수정한 내용은 자동으로 한쪽을 버리지 않고 충돌 보관함에 보존합니다. 현재 보관된 충돌: <b>${conflictCount}건</b>. 기기 날짜·시간은 ‘자동 설정’을 켜 두세요. 시계 차이가 크면 수정 순서 판단이 달라질 수 있습니다.
           <div class="row" style="margin-top:8px"><button class="btn ghost sm" id="syncConflictExport" ${conflictCount?'':'disabled'}>충돌 자료 내려받기</button></div>
         </div>
+        <div class="note">📥 <b>jw.org 주간 자료 자동 받기</b> — ${(()=>{ const a = JWAuto.status(); return a ? `마지막으로 받은 자료: ${esc(String(a.generated||'').replace('T',' ').slice(0,16))} (교재 ${a.weeks}주 · 파수대 ${a.wt}개 · 성경 범위 ${a.bible}개)` : '아직 받은 자료가 없습니다.'; })()}
+          <div class="row" style="margin-top:8px"><button class="btn ghost sm" id="jwAutoLoad" ${Sync.token()?'':'disabled'}>지금 불러오기</button><a class="btn ghost sm" href="https://github.com/speed2892/jiphoe/actions/workflows/jw-weekly.yml" target="_blank" rel="noopener">GitHub에서 새로 받기 ↗</a></div></div>
         <details class="more"><summary>토큰 만드는 방법</summary><ol class="desc" style="margin:8px 0 0;padding-left:18px">
           <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=jiphoe-hub" target="_blank" rel="noopener">여기</a>를 눌러 GitHub에 로그인 (권한은 gist 하나만 체크된 상태)</li>
           <li>맨 아래 ‘Generate token’ → 나온 토큰 복사 → 위 칸에 붙여넣고 ‘연결’</li>
@@ -2293,6 +2323,7 @@ const Views = {
       st.className='st'; st.textContent='연결하는 중…';
       try{ await Sync.connect(t); st.className='st ok'; st.textContent='연결했습니다. 이제 자동으로 동기화됩니다.'; render(); }
       catch(e){ st.className='st err'; st.textContent='연결 실패: '+e.message; } };
+    if($('#jwAutoLoad')) $('#jwAutoLoad').onclick = async ()=>{ $('#jwAutoLoad').disabled = true; await JWAuto.load({force:true, quiet:false}); render(); };
     $('#syncNow').onclick = async ()=>{ await Sync.now(); render(); toast(Sync.status().state==='ok' ? '동기화했습니다.' : '동기화 오류: '+Sync.status().err); };
     $('#syncOff').onclick = ()=>{ Sync.disconnect(); render(); toast('동기화 연결을 해제했습니다. 이 기기의 내용은 그대로 남습니다.'); };
 
@@ -2491,7 +2522,7 @@ Store.on(info=>{ if(info.remote && ['week','settings'].includes(current) && !doc
 
 /* 앱을 새로 열 때 지난 주가 선택되어 있으면 이번 주로 돌아오기 */
 if((Settings.get('weekSel')||'') < Weeks.thisId()) Settings.set('weekSel', Weeks.thisId());
-applyTheme(); render(); refreshPills(); AI.probe(); if(Sync.token()) Sync.now();
+applyTheme(); render(); refreshPills(); AI.probe(); if(Sync.token()){ Sync.now(); setTimeout(()=>JWAuto.load(), 1500); }
 /* 새 버전 확인: GitHub Pages는 파일을 최대 10분 캐시하므로, 서버의 index.html 버전을 직접 비교해 알려 준다 */
 if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
   addEventListener('load', async ()=>{
