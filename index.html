@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.4 (참조 출판물 원문)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'0.8.5 (참조 원문 자동 교체)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1004,7 +1004,11 @@ const Research = {
   localPubRefs(pubs, weekId){
     const list = weekId ? (Store.get('pubrefs', weekId) || []) : []; if(!list.length) return {found:[], missing:pubs};
     const found = [], missing = [];
-    for(const r of pubs){ const k = this.pubKey(r); const hit = list.find(c=>{ const ck = this.pubKey(c.ref); return ck===k || ck.endsWith(k) || k.endsWith(ck); });
+    /* 같은 출판물(「」 안 약호)과 같은 첫 면 번호면 같은 참조로 본다 */
+    const sig = r => { const m = String(r||'').match(/「([^」]+)」\s*([\d/ ]*?)\s*(\d+)\s*(?:-\s*\d+\s*)?면/); return m ? m[1].replace(/\s/g,'')+'|'+m[3] : ''; };
+    for(const r of pubs){ const k = this.pubKey(r), sg = sig(r);
+      const hit = list.find(c=>this.pubKey(c.ref)===k) || list.find(c=>{ const ck = this.pubKey(c.ref); return ck.includes(k) || k.includes(ck); }) || (sg && list.find(c=>sig(c.ref)===sg))
+        || (!/면/.test(r) && list.find(c=>this.pubKey(c.ref).startsWith(this.pubKey(r).replace(/\d+장.*$/,''))));
       if(hit) found.push({id:'pub-'+r, kind:'pub', title:r, source:'출판물 참조 (교재 원문)', text:hit.text, link:'', checked:true}); else missing.push(r); }
     return {found, missing};
   },
@@ -1134,6 +1138,12 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
     const saved = Store.get('research', key) || null;
     const st = {refs: saved ? saved.refs : refs, kws: saved ? saved.kws : kws, pubs: saved && saved.pubs ? saved.pubs : (pubs||[]), items: saved ? saved.items : []};
     const pubOn = pubs!==null || !!ctx;
+    if(pubOn && ctx && ctx.weekId && st.pubs.length){
+      const loc = this.localPubRefs(st.pubs, ctx.weekId).found;
+      if(loc.length){ const keys = new Set(loc.map(l=>this.pubKey(l.title)));
+        const before = st.items.length;
+        st.items = [...loc, ...st.items.filter(i=>i.kind!=='pub' || !keys.has(this.pubKey(String(i.title).split(' — ')[0])))];
+        if(saved) Store.set('research', key, Object.assign({}, saved, {items:st.items})); } }
     const apiOn = !!(Settings.get('apiKey','')||'').trim() || (AI.provider()==='openrouter' && !!(Settings.get('openrouterKey','')||'').trim());
     const opts = Object.assign({verses:true, pubs:apiOn, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {})); if(!apiOn){ opts.pubs = false; opts.study = false; }
     const draw = () => {
