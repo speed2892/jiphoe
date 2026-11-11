@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.2 (연설: 요점-낭독-설명 구성)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.3 (영적 보물 10개·읽기 범위 연구 노트)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1031,11 +1031,11 @@ const JWRefs = {
   async request(refs){
     if(!refs.length || !Sync.token()) return false;
     /* 같은 요청은 10분에 한 번만 (GitHub 요청 수를 아끼기 위해) */
-    const sent = Settings.get('jwReqSent', {}) || {}, now = Date.now(), sig = x => typeof x==='string' ? x : (x.study ? 'study:'+x.study : x.ref+'@'+(x.ch||x.doc||''));
+    const sent = Settings.get('jwReqSent', {}) || {}, now = Date.now(), sig = x => typeof x==='string' ? x : (x.study ? 'study:'+x.study : x.studych ? 'studych:'+x.studych : x.ref+'@'+(x.ch||x.doc||''));
     refs = refs.filter(x=>!(sent[sig(x)] && now - sent[sig(x)] < 600000)); if(!refs.length) return true;
     refs.forEach(x=>sent[sig(x)] = now); Object.keys(sent).forEach(k=>{ if(now - sent[k] > 86400000) delete sent[k]; }); Settings.set('jwReqSent', sent);
     let cur = []; try{ cur = JSON.parse(await Sync.readFile('jw-requests.json') || '[]'); }catch(e){}
-    const norm = x => typeof x==='string' ? {ref:x} : x, k = x => norm(x).study ? 'study:'+norm(x).study : norm(x).ref+'@'+(norm(x).ch||'');
+    const norm = x => typeof x==='string' ? {ref:x} : x, k = x => norm(x).study ? 'study:'+norm(x).study : norm(x).studych ? 'studych:'+norm(x).studych : norm(x).ref+'@'+(norm(x).ch||'');
     const map = new Map(cur.map(x=>[k(x), norm(x)])); const n0 = map.size;
     refs.forEach(x=>{ const v = norm(x); if(v.ref) map.delete(v.ref+'@'); map.set(k(v), v); });
     if(map.size === n0 && refs.every(x=>cur.some(c=>k(c)===k(x)))) return true;
@@ -1063,6 +1063,23 @@ const JWStudy = {
     refs.forEach(r=>{ const m = String(r).match(/^(.+?)\s(\d{1,3}):(\d{1,3})(?:\s*-\s*(\d{1,3}))?/); const bn = m && bookNo(m[1]); if(!bn) return;
       for(let v = +m[3]; v <= Math.min(+(m[4]||m[3]), +m[3]+4); v++) out.push({key:`${bn}/${m[2]}/${v}`, label:`${m[1]} ${m[2]}:${v}`}); });
     return out.filter((x,i,a)=>a.findIndex(y=>y.key===x.key)===i);
+  },
+  /* '예레미야 51-52장' → ['24/51','24/52'] */
+  chapterKeys(range){ const m = String(range||'').match(/^(.+?)\s(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*장/); const bn = m && bookNo(m[1]); if(!bn) return [];
+    const out = []; for(let c = +m[2]; c <= +(m[3]||m[2]); c++) out.push({key:`${bn}/${c}`, label:`${m[1]} ${c}장`}); return out; },
+  /* 읽기 범위 전체의 연구 노트·연구 자료 찾아보기(면 글 포함) — 없으면 GitHub에 요청 */
+  async chapters(range){
+    const ks = this.chapterKeys(range); if(!ks.length) return {have:[], missing:[]};
+    const all = await JWRefs.load(), have = [], miss = [];
+    ks.forEach(k=>{ const h = all['studych:'+k.key]; if(h && h.ok) have.push({...k, ...h}); else if(!h) miss.push(k); });
+    if(miss.length) await JWRefs.request(miss.map(k=>({studych:k.key}))).catch(()=>{});
+    return {have, missing:miss};
+  },
+  chapterText(have){
+    return have.map(h=>{ const bk = h.label.replace(/\s\d+장$/,''), ch = h.key.split('/')[1];
+      const vs = Object.keys(h.verses||{}).sort((a,b)=>a-b).map(v=>{ const x = h.verses[v]; return `${bk} ${ch}:${v} — ${x.notes ? '연구 노트: '+x.notes : ''}${x.rsg && x.rsg.length ? (x.notes?' / ':'')+'연구 자료 찾아보기: '+x.rsg.join('; ') : ''}`; }).join('\n');
+      const rf = (h.refs||[]).map(r=>`## ${bk} ${ch}:${r.v} · ${r.ref}\n${String(r.text).slice(0, 2500)}`).join('\n\n');
+      return `### ${h.label}\n${vs}${rf ? `\n\n[연구 자료 찾아보기 원문]\n${rf}` : ''}`; }).join('\n\n');
   },
   async items(refs){
     const ks = this.keys(refs); if(!ks.length) return {items:[], missing:0};
@@ -1277,7 +1294,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
         st.items = [...loc, ...st.items.filter(i=>i.kind!=='pub' || !keys.has(this.pubKey(String(i.title).split(' — ')[0])))];
         if(saved) Store.set('research', key, Object.assign({}, saved, {items:st.items, pubs:st.pubs})); } }
     const apiOn = !!(Settings.get('apiKey','')||'').trim() || (AI.provider()==='openrouter' && !!(Settings.get('openrouterKey','')||'').trim());
-    const opts = Object.assign({verses:true, pubs:apiOn, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {})); if(!apiOn){ opts.pubs = false; if(!Sync.token()) opts.study = false; }
+    const opts = Object.assign({verses:true, pubs:apiOn, study:apiOn, library:true, articles:true, exp:true}, Settings.get('researchOpts', {})); if(!apiOn && !Sync.token()){ opts.pubs = false; opts.study = false; }
     const draw = () => {
       const groups = Object.keys(this.KIND).map(k=>{ const g = st.items.filter(i=>i.kind===k); if(!g.length) return '';
         return `<div class="rgrp"><div class="rgh">${this.KIND[k][0]} ${this.KIND[k][1]} <span class="badge" data-cnt="${k}">${g.filter(i=>i.checked).length}/${g.length}</span> <button class="btn ghost sm" data-all="${k}" style="padding:2px 8px">모두 선택</button> <button class="btn ghost sm" data-none="${k}" style="padding:2px 8px">모두 해제</button></div>`
@@ -1288,7 +1305,7 @@ ${pubs.length ? `찾을 참조: ${pubs.join(' / ')}` : '찾을 참조: 그 순�
           <div><label>핵심어 (쉼표로 구분)</label><input type="text" data-k="kws" value="${esc(st.kws.join(', '))}" placeholder="예: 부활, 희망"></div>
         </div>
         ${pubOn ? `<label>출판물 참조 (; 로 구분 — 비워 두면 교재 페이지에서 찾음)</label><input type="text" data-k="pubs" value="${esc(st.pubs.join('; '))}" placeholder="예: 「파17.10」 23면 9-10항; 「예레」 29면">` : ''}
-        <div class="rops">${[['verses','성구 본문'], ...(pubOn ? [['pubs','출판물 참조'+(apiOn?'':' (Claude API 키 필요)')]] : []), ['study','연구 노트'+(apiOn?'':' (Claude API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${((k==='study'&&!Sync.token())||k==='pubs')&&!apiOn?'disabled':''}> ${t}</label>`).join('')}</div>
+        <div class="rops">${[['verses','성구 본문'], ...(pubOn ? [['pubs','출판물 참조'+(apiOn||Sync.token()?'':' (동기화 또는 API 키 필요)')]] : []), ['study','연구 노트'+(apiOn||Sync.token()?'':' (동기화 또는 API 키 필요)')],['library','내 자료'+(lib.length?'':' (없음)')],['articles','jw.org 기사'],['exp','경험담']].map(([k,t])=>`<label><input type="checkbox" data-o="${k}" ${opts[k]?'checked':''} ${(k==='study'||k==='pubs')&&!apiOn&&!Sync.token()?'disabled':''}> ${t}</label>`).join('')}</div>
         <div class="row" style="margin-top:6px"><button class="btn" data-act="run">🔎 조사하기</button>${st.items.length?`<span class="st" style="margin:0" data-k="selcount">${st.items.filter(i=>i.checked).length}개 선택됨 — 체크한 자료만 AI 작성에 쓰입니다.</span>`:''}</div>
         <div class="st" data-k="status">${saved && saved.at ? '마지막 조사: '+fmtTime(saved.at) : ''}</div>
         ${groups}`;
@@ -1610,11 +1627,18 @@ const Gems = {
 1. 교재 질문과 성경 읽기 본문, 제공된 조사 자료(연구 노트·연구 자료 찾아보기·출판물 발췌)에 근거해 답합니다.
 2. 교재가 가리킨 출판물(「예레」 165면 등)의 본문이 자료에 없으면 내용을 지어내지 말고 '확인 필요'와 함께 출처만 적습니다.
 3. 존댓말 구어체 해설 문장으로 씁니다.`,
-  prompt(w, part, bible, mat){
+  prompt(w, part, bible, mat, chap){
     return `# 이번 주: ${w.label} · 성경 읽기 ${w.reading}\n\n# 교재 '영적 보물 찾기'\n${part ? part.detail : '(교재 내용 없음)'}\n`
       + (bible ? `\n# 성경 읽기 본문 (신세계역 연구용)\n${bible.slice(0, 14000)}\n` : '')
       + (mat ? `\n# 조사 자료${mat}\n` : '')
-      + `\n# 요청\n1) 질문 1(성구 질문)에 대한 해설 답변: 30초 분량 1개와, 다른 각도의 부가 답변 2개\n2) 질문 2 "이번 주 성경 읽기를 통해 어떤 영적 보물을 발견했습니까?"에 쓸 수 있는 영적 보물 3개 (각각 성구 장:절 + 1-2문장 해설 + 적용점)\n소제목을 붙여 읽기 쉽게 쓰십시오.`;
+      + (chap ? `\n# 읽기 범위의 연구 노트·연구 자료 찾아보기 (연구용 성경)\n${chap}\n` : '')
+      + `\n# 요청\n1) 질문 1(성구 질문)에 대한 해설 답변: 30초 분량 1개와, 다른 각도의 부가 답변 2개\n2) 질문 2 "이번 주 성경 읽기를 통해 어떤 영적 보물을 발견했습니까?"에 쓸 영적 보물 10개.
+   읽기 범위 전체에서 고르되, 연구 노트·연구 자료 찾아보기가 있는 성구를 우선합니다. 보물마다 다음 형식:
+   【보물 n】 성구 장:절 — 그 절의 핵심 표현(짧게 인용)
+   · 성구의 요점: 그 표현이 무엇을 뜻하는지 (연구 노트·참조 출판물 원문이 있으면 그 내용으로 설명하고 출처를 괄호로)
+   · 우리는 어떻게 해야 하는가: 이 요점에서 얻는 구체적인 교훈과 적용 1-2문장
+   예) 【보물】 예레미야 51:3 — "궁수가 활을 당기지 못하게 하고" · 성구의 요점: 활을 당기지 못하는 궁수는 쓸모가 없듯이, 바빌론의 군대는 무력해질 것이었다. · 우리는 어떻게 해야 하는가: 하느님을 대적하는 어떤 세력도 그분의 뜻을 막을 수 없으므로, 두려워하기보다 여호와의 약속을 신뢰한다.
+소제목을 붙여 읽기 쉽게 쓰십시오.`;
   }
 };
 /* D:\JW 파일 이름으로 종류 나누기: …_집회교재_… / …_성경범위_… / 그 밖의 날짜 파일 = 파수대 연구 기사 */
@@ -1892,8 +1916,8 @@ const Bundle = {
     for(const p of (w.parts||[])){
       const kind = Practice.kind(p), vids = JWVideo.titlesIn(p.detail);
       if(kind==='gems'){
-        const bible = Store.get('bible', id);
-        secs.push(`=== [G] === (${p.no}. ${p.title})\n` + Gems.prompt(w, p, bible && this.cap(bible.text, 9000), this.cap(Research.materialText(`gems:${id}`) || this.partMat(id, p), 7000)));
+        const bible = Store.get('bible', id); const ch = await JWStudy.chapters(w.reading).catch(()=>({have:[]}));
+        secs.push(`=== [G] === (${p.no}. ${p.title})\n` + Gems.prompt(w, p, bible && this.cap(bible.text, 9000), this.cap(Research.materialText(`gems:${id}`) || this.partMat(id, p), 7000), this.cap(JWStudy.chapterText(ch.have||[]), 12000)));
         plan.push(`[G] ${p.no}. ${p.title}: 해설 답변과 영적 보물`);
       } else if(vids.length || (kind==='life' && JWVideo.questionsIn(p.detail).length)){
         const vv = (await Promise.all(vids.map(t=>JWVideo.get(t).catch(()=>null)))).filter(Boolean);
@@ -2327,12 +2351,19 @@ const Views = {
         <textarea id="gOut" style="min-height:260px;margin-top:10px" placeholder="만든 해설이 여기에 나옵니다. 직접 고칠 수 있습니다.">${esc(g.out||'')}</textarea>
         ${leg.length ? `<details class="more"><summary>기존 집회 계획표에서 가져온 해설 ${leg.length}개</summary>${leg.map(x=>`<div class="note" style="white-space:pre-line">${esc(x.v)}</div>`).join('')}</details>` : ''}</div>`;
     bindWeekBar(el, ids, id);
+    /* 읽기 범위 연구 노트 상태 */
+    if(Sync.token() && w.reading){ const box = document.createElement('p'); box.className = 'desc'; box.id = 'gChap'; box.textContent = '📘 읽기 범위 연구 노트 확인 중…';
+      const card = $('#gR', el).closest('.card'); card.insertBefore(box, $('#gR', el));
+      JWStudy.chapters(w.reading).then(r=>{ const b = $('#gChap'); if(!b) return;
+        b.innerHTML = JWStudy.chapterKeys(w.reading).map(k=>{ const h = (r.have||[]).find(x=>x.key===k.key);
+          return h ? `✅ ${esc(k.label)} 연구 노트 ${Object.keys(h.verses||{}).length}절 · 연구 자료 원문 ${(h.refs||[]).length}개` : `⏳ ${esc(k.label)} — GitHub에서 받는 중 (몇 분 뒤, 늦어도 1시간)`; }).join('<br>') + '<br><span>영적 보물 10개를 만들 때 함께 쓰입니다.</span>'; }).catch(()=>{}); }
     Research.mount($('#gR', el), `gems:${id}`, {refs, kws:part ? keywordsOfText(part.detail, 6) : [], title:`${w.label} 영적 보물`, pubs:part ? extractPubRefs([part.title, part.sub, part.detail].join('\n')) : [], ctx:{weekId:id, title:part ? part.title : '영적 보물 찾기'}});
     if($('#gBible')){ $('#gBible').onclick = ()=>$('#gBibleFile').click(); $('#gBibleFile').onchange = async e=>{ await importJWFiles([...e.target.files]); render(); }; }
     const out = $('#gOut'); let tm; out.oninput = ()=>{ clearTimeout(tm); tm = setTimeout(()=>Store.set('gems', id, {...(Store.get('gems', id)||{}), out:out.value}), 400); };
     $('#gGo').onclick = async ()=>{ const st = $('#gSt'); if(!AI.mode()){ st.className='st err'; st.textContent='설정에서 AI를 먼저 연결해 주세요.'; return; }
       $('#gGo').disabled = true; st.className='st'; st.textContent='작성 중…';
-      try{ const txt = await AI.write({system:Gems.rules, prompt:Gems.prompt(w, part, bible && bible.text, Research.materialText(`gems:${id}`)), maxTokens:5000, onText:x=>{ out.value = x; }});
+      try{ const ch = await JWStudy.chapters(w.reading).catch(()=>({have:[]}));
+        const txt = await AI.write({system:Gems.rules, prompt:Gems.prompt(w, part, bible && bible.text, Research.materialText(`gems:${id}`), Bundle.cap(JWStudy.chapterText(ch.have||[]), 14000)), maxTokens:8000, onText:x=>{ out.value = x; }});
         Store.set('gems', id, {...(Store.get('gems', id)||{}), out:txt}); st.className='st ok'; st.textContent='완료 — 직접 고쳐서 쓰세요.'; }
       catch(e){ st.className='st err'; st.textContent='오류: '+e.message; }
       $('#gGo').disabled = false; };
