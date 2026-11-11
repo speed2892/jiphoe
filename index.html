@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.0 (이번 주 전체 한 번에)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.2 (연설: 요점-낭독-설명 구성)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -268,8 +268,12 @@ const Sync = (()=>{
   const setState = (s, err='') => { state = s; lastErr = err; document.dispatchEvent(new CustomEvent('syncstate')); };
   async function gh(path, opt={}){
     const r = await fetch(API+path, {...opt, headers:{'Authorization':'Bearer '+token(), 'Accept':'application/vnd.github+json', ...(opt.headers||{})}});
-    if(r.status===401) throw new Error('토큰이 맞지 않습니다.');
-    if(r.status===403 || r.status===404) throw new Error('토큰에 gist 권한이 없거나 Gist를 찾지 못했습니다.');
+    if(r.status===401) throw new Error('토큰이 맞지 않습니다. 토큰을 다시 복사해 넣어 주세요.');
+    if(r.status===403 || r.status===429){
+      let m = ''; try{ m = (await r.clone().json()).message || ''; }catch(e){}
+      if(/rate limit/i.test(m) || r.headers.get('x-ratelimit-remaining')==='0' || r.status===429) throw new Error('GitHub 요청이 너무 많아 잠시 막혔습니다. 10-20분 뒤 다시 해 보세요.');
+      throw new Error('토큰에 gist 권한이 없습니다. GitHub 토큰 설정에서 gist에 체크해 주세요.'); }
+    if(r.status===404){ const e = new Error('Gist를 찾지 못했습니다.'); e.notFound = true; throw e; }
     if(!r.ok) throw new Error('GitHub 오류 '+r.status);
     return r;
   }
@@ -283,7 +287,9 @@ const Sync = (()=>{
     Settings.set('gistId', id); return id;
   }
   async function readRemote(id){
-    const g = await (await gh('/gists/'+id)).json();
+    let g;
+    try{ g = await (await gh('/gists/'+id)).json(); }
+    catch(e){ if(!e.notFound) throw e; Settings.set('gistId',''); const nid = await gistId(); g = await (await gh('/gists/'+nid)).json(); }
     const f = g.files && g.files[FILE]; if(!f) return {v:1, data:{}, stamps:{}};
     let text = f.content;
     if(f.truncated && f.raw_url) text = await (await fetch(f.raw_url)).text();
@@ -1009,7 +1015,7 @@ function extractPubRefs(text){
    GitHub(jw-weekly)가 jw.org 공식 EPUB에서 꺼내 Gist의 jw-refs.json에 넣어 준다. 앱은 요청만 올린다. */
 const JWRefs = {
   all(){ return Store.get('meta', 'jwrefs', {}) || {}; },
-  async load(){ try{ const raw = await Sync.readFile('jw-refs.json'); if(raw){ Store.set('meta', 'jwrefs', JSON.parse(raw)); } }catch(e){} return this.all(); },
+  async load(){ if(this._at && Date.now()-this._at < 60000) return this.all(); this._at = Date.now(); try{ const raw = await Sync.readFile('jw-refs.json'); if(raw){ Store.set('meta', 'jwrefs', JSON.parse(raw)); } }catch(e){} return this.all(); },
   /* '[연구 자료 찾아보기] 「파수대」 2008/6/15, 8-9면; 「통찰」 제1권 785면' → 참조 목록 */
   parse(text){
     const out = []; let last = '';
@@ -1024,6 +1030,10 @@ const JWRefs = {
   /* refs: '「통찰」 제1권 785면' 또는 {ref, ch:'24/51'} (ch = 연구용 성경 책/장 — 공식 파일에 없을 때 온라인 라이브러리에서 찾는 데 씀) */
   async request(refs){
     if(!refs.length || !Sync.token()) return false;
+    /* 같은 요청은 10분에 한 번만 (GitHub 요청 수를 아끼기 위해) */
+    const sent = Settings.get('jwReqSent', {}) || {}, now = Date.now(), sig = x => typeof x==='string' ? x : (x.study ? 'study:'+x.study : x.ref+'@'+(x.ch||x.doc||''));
+    refs = refs.filter(x=>!(sent[sig(x)] && now - sent[sig(x)] < 600000)); if(!refs.length) return true;
+    refs.forEach(x=>sent[sig(x)] = now); Object.keys(sent).forEach(k=>{ if(now - sent[k] > 86400000) delete sent[k]; }); Settings.set('jwReqSent', sent);
     let cur = []; try{ cur = JSON.parse(await Sync.readFile('jw-requests.json') || '[]'); }catch(e){}
     const norm = x => typeof x==='string' ? {ref:x} : x, k = x => norm(x).study ? 'study:'+norm(x).study : norm(x).ref+'@'+(norm(x).ch||'');
     const map = new Map(cur.map(x=>[k(x), norm(x)])); const n0 = map.size;
@@ -1671,7 +1681,38 @@ let wtAbort = null;
    5-6. 연설·실연 연습
    practice['주#번호'] = { script, mine, feedback }
    ========================================================= */
+/* 성경 읽기 범위(성경범위 파일/자동 받기)에서 절 본문 꺼내기: '예레미야 52:8-11' */
+function verseTextFromBible(ref){
+  const m = String(ref).match(/^(.+?)\s(\d{1,3}):(\d{1,3})(?:-(\d{1,3}))?/); if(!m) return '';
+  const book = m[1].replace(/\s/g,''), ch = +m[2], a = +m[3], b = +(m[4]||m[3]);
+  for(const bb of Object.values(Store.all('bible'))){
+    const t = String(bb && bb.text || ''); const re = /\[(.+?)\s(\d{1,3})장\]/g; let mm, blocks = [];
+    while((mm = re.exec(t))) blocks.push({book:mm[1].replace(/\s/g,''), ch:+mm[2], at:mm.index});
+    const i = blocks.findIndex(x=>x.book===book && x.ch===ch); if(i<0) continue;
+    let body = t.slice(blocks[i].at, i+1<blocks.length ? blocks[i+1].at : undefined).replace(/^\[[^\]]*\]\s*/,'').replace(/[    ]/g,' ');
+    body = body.replace(/^\s*[가-힣 ]+\n/,'');                    // 책 이름 줄
+    /* 절 번호를 순서대로 찾는다: 첫 숫자(장 번호)=1절, 그다음 2, 3 … */
+    const re2 = /(^|[\s.”’?!])(\d{1,3})\s+(?=[가-힣“‘(「*])/g; let exp = 1, prevAt = -1, prevV = 0; const vs = {}; let mv;
+    while((mv = re2.exec(body))){ const n = +mv[2], at = mv.index + mv[1].length;
+      if((exp===1 && prevV===0) || n===exp){ if(prevV) vs[prevV] = body.slice(prevAt, at).replace(/^\d{1,3}\s+/,'').replace(/\s+/g,' ').trim(); prevV = exp; prevAt = at; exp++; } }
+    if(prevV) vs[prevV] = body.slice(prevAt).split(/\n\s*\n/)[0].replace(/^\d{1,3}\s+/,'').replace(/\s+/g,' ').trim();
+    const out = []; for(let v=a; v<=b; v++) if(vs[v]) out.push(`${v} ${vs[v]}`);
+    if(out.length) return out.join(' ');
+  }
+  return '';
+}
 const Practice = {
+  /* 교재 요점 줄 → 연설 골자: 요점 문장 / 낭독 성구 / 참조 출판물 / 묵상해 볼 점 */
+  outline(p){
+    const pts = [], lines = String(p.detail||'').split(/\n+/).map(x=>x.trim()).filter(Boolean); let think = '';
+    lines.forEach(l=>{
+      if(/^묵상해 볼 점/.test(l)){ think = l.replace(/^묵상해 볼 점\s*:?\s*/,''); return; }
+      const m = l.match(/^(.*?)\s*\(([^()]*\d[^()]*)\)\s*\.?$/); if(!m) return;
+      const refs = extractScriptures(m[2]); if(!refs.length && !/「/.test(m[2])) return;
+      pts.push({point:m[1].replace(/[.。]$/,''), raw:m[2], refs, pubs:extractPubRefs(m[2])});
+    });
+    return {pts, think};
+  },
   kind(p){
     if(!p) return 'talk';
     if(/성경 낭독/.test(p.title)) return 'reading';
@@ -1695,6 +1736,23 @@ const Practice = {
     if(kind==='demo') return base + `\n# 요청\n${p.min}분 안에 할 수 있는 실연 예시 대본을 쓰십시오. 전도인(학생)과 집주인 두 사람의 대화로, 장면 설정을 그대로 따르고 교재가 가리킨 과·요점을 실연에서 보여 주도록 합니다. 대본 앞에 "이 실연의 목표" 2줄, 대본 뒤에 "연습할 때 기억할 점" 3개를 적으십시오. 대화 줄은 "전도인:" "집주인:"으로 시작하십시오.`;
     if(kind==='reading') return base + `\n# 요청\n이 성경 낭독을 연습하도록 도와주십시오. ① 낭독 범위에서 강조해 읽을 낱말·구절과 쉼표에서 쉬어 읽을 곳을 알려 주고 ② 읽기 어려운 낱말(지명·인명)의 읽는 법을 적고 ③ 교재가 가리킨 과의 이름만 언급하며 연습 방법 3가지를 적으십시오. 성구 본문이 제공되지 않았다면 본문을 지어내지 마십시오.`;
     if(kind==='life') return base + `\n# 요청\n이 순서를 맡은 사람이 쓸 진행 메모를 만드십시오: 도입 한두 문장, 교재 질문별로 청중에게 물을 질문과 기대 답 요지, 마무리 적용 한두 문장.`;
+    const ol = this.outline(p);
+    if(ol.pts.length >= 2){
+      const plan = ol.pts.map((x,i)=>{ const vt = x.refs.map(r=>{ const t = verseTextFromBible(r); return t ? `   · ${r} 본문: ${t}` : ''; }).filter(Boolean).join('\n');
+        return `요점 ${i+1}: ${x.point}\n   낭독: ${x.refs.length ? x.refs.join(', ').replace(/(\S+ \d+):(\d+), \1:(\d+)/g,'$1:$2, $3') : '(성구 없음)'}${x.pubs.length ? `\n   참조: ${x.pubs.join('; ')}` : ''}${vt ? '\n'+vt : ''}`; }).join('\n');
+      return base + `\n# 연설 골자 (교재 요점 — 이 순서대로)\n${plan}${ol.think ? `\n결론에서 답할 묵상해 볼 점: ${ol.think}` : ''}
+# 요청
+약 ${p.min*330}자(${p.min}분) 분량의 연설문을 아래 구성으로 쓰십시오.
+1) 도입 (30초 안팎): 청중의 관심을 끄는 질문이나 짧은 예, 그리고 오늘 다룰 요점 소개.
+2) 요점마다 같은 순서로 전개:
+   ① 교재의 요점 문장을 소제목처럼 분명히 말합니다. (예: "첫째로, 시드기야는 알면서도 옳은 일을 하지 않았습니다.")
+   ② 그 요점을 뒷받침하는 교재의 성구를 따로 한 줄에 [성구 낭독: 예레미야 52:1, 2] 처럼 표시합니다.
+   ③ 낭독한 성구의 핵심 표현을 짚어 무엇을 보여 주는지 설명합니다(제공된 성구 본문에 근거).
+   ④ 참조 출판물 원문·연구 노트가 있으면 그 요점으로 배경과 의미를 넓히고 출처를 말로 밝힙니다.
+   ⑤ 다음 요점으로 넘어가는 연결 문장.
+3) 결론 (1분 안팎): 요점을 짧게 되짚고, 묵상해 볼 점에 답하며 우리 생활에 적용할 점 2-3가지를 구체적으로 제시합니다.
+각 부분 앞에 [도입], [요점 1], [요점 2], [결론] 처럼 표시를 붙이십시오.`;
+    }
     return base + `\n# 요청\n약 ${p.min*330}자(${p.min}분) 분량의 연설문을 쓰십시오. 교재 요점을 순서대로 다루고, 요점마다 교재 본문에 달린 성구(낭독 안내)와 출판물 참조 요점·연구 노트를 활용해 설명과 예를 덧붙이십시오. 짧은 도입과 실제적인 적용·결론을 넣고, 묵상해 볼 점이 있으면 결론에서 답하십시오.`;
   },
   feedbackPrompt(w, p, kind, script, mine, secs){
@@ -2058,7 +2116,7 @@ const Views = {
       try{ const {text, plan} = await Bundle.build(w.id);
         let ok = true; try{ await navigator.clipboard.writeText(text); }catch(e){ ok = false; }
         window.open('https://claude.ai/new', '_blank', 'noopener'); allWaiting = text.slice(0, 80);
-        document.addEventListener('visibilitychange', ()=>setTimeout(allBack, 400)); window.addEventListener('focus', ()=>setTimeout(allBack, 400));
+        window.onAppBack = allBack;
         const box = document.createElement('div'); box.className = 'card';
         box.innerHTML = `<h2>🗂️ 이번 주 전체를 Claude로</h2><p class="desc">${ok ? `요청 글(${text.length.toLocaleString()}자, ${plan.length}개 구역)을 복사하고 Claude를 열었습니다.` : '자동 복사가 안 되었습니다.'} Claude 입력칸을 길게 눌러 <b>붙여넣기</b> → 보내기. 답이 끝나면 <b>답 전체를 복사</b>해서 돌아오면 순서마다 자동으로 들어갑니다.</p>
           <ul class="desc">${plan.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
@@ -2368,8 +2426,8 @@ const Views = {
         lvWaiting = true; st.className='st ok';
         st.textContent = `요청 글을 복사하고 Claude를 열었습니다 (${t.length.toLocaleString()}자). 입력칸이 비어 있으면 길게 눌러 붙여넣고 보내세요. 답을 복사해 돌아오면 자동으로 들어갑니다.`; };
       $('#lvPaste').onclick = ()=>lvTryClipboard(false);
-      const lvBack = () => { if(lvWaiting && document.visibilityState==='visible' && $('#lvSt')) setTimeout(()=>lvTryClipboard(true), 400); };
-      document.addEventListener('visibilitychange', lvBack); window.addEventListener('focus', lvBack);
+      const lvBack = () => { if(lvWaiting && document.visibilityState==='visible' && $('#lvSt')) lvTryClipboard(true); };
+      window.onAppBack = lvBack;
       $('#lvCopy').onclick = async ()=>{ const cur = (Store.get('practice', key)||{}).lv || {}; const t = lvQs.map((q,i)=>`${q}\n${cur['Q'+(i+1)]||''}`).join('\n\n');
         try{ await navigator.clipboard.writeText(t); toast('답을 복사했습니다.'); }catch(e){ toast('복사하지 못했습니다.'); } };
     }
@@ -2416,7 +2474,7 @@ const Views = {
       try{ const t = (await navigator.clipboard.readText()||'').trim();
         if(t && t.length > 80 && !t.startsWith(prWaiting.slice(0, 60))){ prWaiting = ''; sc.value = t; save({script:t});
           const st = $('#prSt'); st.className='st ok'; st.textContent = `Claude 원고를 넣었습니다 — 약 ${t.length.toLocaleString()}자 (≈${(t.length/330).toFixed(1)}분)`; toast('Claude 원고를 넣었습니다.'); } }catch(e){} };
-    document.addEventListener('visibilitychange', ()=>setTimeout(prBack, 400)); window.addEventListener('focus', ()=>setTimeout(prBack, 400));
+    if(!$('#lvVids')) window.onAppBack = prBack; const prevBack = window.onAppBack; if(prevBack!==prBack) window.onAppBack = ()=>{ prevBack(); prBack(); };
     $('#prPaste').onclick = async ()=>{ const st = $('#prSt');
       try{ const t = (await navigator.clipboard.readText()||'').trim(); if(!t) throw new Error('empty');
         sc.value = t; save({script:t}); st.className='st ok'; st.textContent = `붙여넣었습니다 — 약 ${t.length.toLocaleString()}자 (≈${(t.length/330).toFixed(1)}분)`; }
@@ -2922,6 +2980,7 @@ function bindWol(el){
    ========================================================= */
 let current = null;
 function render(){
+  window.onAppBack = null;
   const id = (location.hash.slice(1) || Settings.get('lastView') || 'week');
   const v = VIEWS.find(x=>x.id===id) || VIEWS[0];
   if(current !== v.id) window.scrollTo(0, 0);
@@ -2957,6 +3016,7 @@ Store.on(info=>{ if(info.remote && ['week','settings'].includes(current) && !doc
 
 /* 앱을 새로 열 때 지난 주가 선택되어 있으면 이번 주로 돌아오기 */
 if((Settings.get('weekSel')||'') < Weeks.thisId()) Settings.set('weekSel', Weeks.thisId());
+window.onAppBack = null; const fireBack = ()=>{ if(typeof window.onAppBack==='function') setTimeout(window.onAppBack, 400); }; document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') fireBack(); }); window.addEventListener('focus', fireBack);
 document.addEventListener('click', e=>{ const b = e.target.closest && e.target.closest('[data-golv]'); if(!b) return; Settings.set('prPart:'+b.dataset.wid, b.dataset.golv); Settings.set('weekSel', b.dataset.wid); location.hash = '#talk'; });
 applyTheme(); render(); refreshPills(); AI.probe(); if(Sync.token()){ Sync.now(); setTimeout(()=>JWAuto.load(), 1500); }
 /* 새 버전 확인: GitHub Pages는 파일을 최대 10분 캐시하므로, 서버의 index.html 버전을 직접 비교해 알려 준다 */
