@@ -324,6 +324,36 @@ def study_verse(key):
     if marg: lines.append('[상호 참조] ' + ' / '.join(marg))
     return {'notes': '\n'.join(lines) or '(연구 노트 없음)', 'refs': refs}
 
+def study_chapter(key, max_pages=14):
+    """'24/51' → 그 장 모든 절의 연구 노트·연구 자료 찾아보기 목록 + 연구 자료 찾아보기 면 글(최대 max_pages개)"""
+    from bs4 import BeautifulSoup
+    b, c = key.split('/')
+    soup = BeautifulSoup(wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{b}/{c}'), 'html.parser')
+    txt = lambda el: re.sub(r'\s+', ' ', el.get_text(' ', strip=True)).strip()
+    verses, links = {}, []
+    for sec in soup.select(f'div.section[data-key^="{b}-{c}-"]'):
+        v = sec['data-key'].split('-')[-1]
+        notes = [txt(li) for li in sec.select('.studyNoteGroup li.studyNote')]
+        rsg = {}
+        for li in sec.select('.group.index li.ref-rsg'):
+            for a in li.select('a[href*="/wol/pc/"]'):
+                rsg[a['href']] = (rsg.get(a['href'], '') + ' ' + txt(a)).strip()
+        if notes or rsg:
+            verses[v] = {'notes': ' / '.join(notes), 'rsg': list(rsg.values())}
+            links += [(v, h, l) for h, l in rsg.items()]
+    refs, seen = [], set()
+    for v, href, label in links:
+        if len(refs) >= max_pages or href in seen: continue
+        seen.add(href)
+        pm = re.search(r'(\d{1,4})(?:\s*-\s*(\d{1,4}))?\s*면', label)
+        pages = list(range(int(pm[1]), min(int(pm[2] or pm[1]), int(pm[1]) + 3) + 1)) if pm else []
+        try:
+            html = wol_get(href); body = html[html.find('<article'):] if '<article' in html else html
+            t = html_pages(body, pages, 3500) if pages else ''
+        except Exception: t = ''
+        if t: refs.append({'v': v, 'ref': label, 'text': t})
+    return {'verses': verses, 'refs': refs}
+
 def html_pages(html, pages, limit=12000):
     segs = re.split(r'<span[^>]*class="pageNum"[^>]*data-no="(\d+)"[^>]*>', html)
     want = set(pages); got = []
@@ -346,6 +376,15 @@ def handle_requests(gh, gid, gist):
     reqs = read(REQ_FILE) or []
     have = read(REF_FILE) or {}
     norm = [r if isinstance(r, dict) else {'ref': r} for r in reqs]
+    chapters = [r['studych'] for r in norm if r.get('studych') and 'studych:' + r['studych'] not in have]
+    for k in chapters[:6]:
+        try:
+            st = study_chapter(k)
+            have['studych:' + k] = dict(st, ok=bool(st['verses']), at=dt.datetime.now(KST).isoformat(timespec='seconds'))
+            print(f"  ✓ 장 연구 노트 {k} · 절 {len(st['verses'])}개 · 연구 자료 면 {len(st['refs'])}개")
+        except Exception as e:
+            have['studych:' + k] = {'ok': False, 'err': e.__class__.__name__, 'verses': {}, 'refs': []}
+            print(f'  ✗ 장 연구 노트 {k} ({e.__class__.__name__} {getattr(e, "code", "")})')
     studies = [r['study'] for r in norm if r.get('study') and 'study:' + r['study'] not in have]
     for k in studies[:40]:
         try:
@@ -372,7 +411,7 @@ def handle_requests(gh, gid, gist):
         except Exception as e:
             have[ref] = {'text': '', 'ok': False, 'err': e.__class__.__name__}
             print(f'  ✗ {ref[:40]} ({e.__class__.__name__})')
-    if todo or studies:
+    if todo or studies or chapters:
         gh('/gists/' + gid, {'files': {REF_FILE: {'content': json.dumps(have, ensure_ascii=False)}}}, 'PATCH')
         print('요청한 면을 Gist에 저장했습니다.')
 
