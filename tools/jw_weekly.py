@@ -4,8 +4,15 @@
 
 환경 변수: JW_GIST_TOKEN (gist 권한 토큰), WEEKS (몇 주 받을지, 기본 4)
 공개 저장소에는 아무 내용도 남기지 않는다(로그에는 파일 이름과 글자 수만 찍는다).
+
+자료를 찾는 순서 (GitHub에서 돌려도, 내 컴퓨터에서 돌려도 같다)
+  1. 내 자료 폴더(D:/JW 또는 JW_LOCAL)의 EPUB 파일 — 내 컴퓨터에서 돌릴 때만 있다
+  2. 워치타워 온라인 라이브러리(wol.jw.org) — 연구용 성경의 연구 노트·연구 자료 찾아보기와 그 원문
+  3. jw.org 공식 다운로드(EPUB)
+내 컴퓨터에서 돌리기: 자료받기.bat 를 두 번 누른다 (토큰은 처음 한 번만 묻는다).
 """
-import io, json, os, re, sys, zipfile, datetime as dt
+import io, json, os, re, sys, time, zipfile, datetime as dt
+from html import unescape
 from html.parser import HTMLParser
 import urllib.request, urllib.parse
 
@@ -19,7 +26,40 @@ def get(url, data=None, headers=None, method=None):
     with urllib.request.urlopen(req, timeout=120) as r:
         return r.read()
 
+# ---------- 내 자료 폴더 (D:\JW) ----------
+def local_dirs():
+    ds = [d for d in os.environ.get('JW_LOCAL', '').split(os.pathsep) if d] + [r'D:\JW']
+    return [d for i, d in enumerate(ds) if os.path.isdir(d) and d not in ds[:i]]
+
+_local = None
+def local_epubs():
+    """내 자료 폴더의 EPUB: {(출판물 기호, 호): 경로}. jw.org 파일 이름 그대로(w_KO_20070601.epub, it-1_KO.epub, wcg_KO.epub)."""
+    global _local
+    if _local is None:
+        _local = {}
+        for d in local_dirs():
+            for root, dirs, files in os.walk(d):
+                dirs[:] = [x for x in dirs if x.lower() != 'claude outputs']
+                for f in files:
+                    if not f.lower().endswith('.epub'): continue
+                    m = re.match(r'([A-Za-z0-9-]+?)_KO(?:_(\d{6,8}))?\.epub$', f, re.I)
+                    if m: _local.setdefault((m[1].lower(), m[2] or ''), os.path.join(root, f))
+                    elif f.startswith('성경'): _local.setdefault(('nwt', ''), os.path.join(root, f))
+        if _local: print(f'내 자료 폴더 EPUB {len(_local)}개: ' + ', '.join(sorted(os.path.basename(v) for v in _local.values()))[:300])
+    return _local
+
+def local_epub(pub, issue=''):
+    """내 자료 폴더에 있을 때만 연다 (내려받지 않는다)"""
+    path = local_epubs().get(((pub or '').lower(), issue or ''))
+    if not path: return None
+    key = ('local', pub, issue)
+    if key not in _cache:
+        try: _cache[key] = zipfile.ZipFile(path)
+        except Exception as e: print(f'  내 자료 파일을 못 엶: {os.path.basename(path)} ({e.__class__.__name__})'); _cache[key] = None
+    return _cache[key]
+
 _cache = {}
+_src = {}
 _titles = {}
 def week_titles(pub, issue):
     """주별 RTF 파일 제목 목록 (예: '11월 9-15일 (예레미야 51-52장)') — 성경 읽기 범위를 알아내는 데 쓴다"""
@@ -35,11 +75,15 @@ RANGE = re.compile(r'([가-힣]+(?:\s[가-힣]+)?\s\d{1,3}(?:\s*[-–]\s*\d{1,3}
 def epub(pub, issue=''):
     key = (pub, issue)
     if key in _cache: return _cache[key]
+    z = local_epub(pub, issue)                      # 1순위: 내 자료 폴더
+    if z:
+        if pub != 'nwt' or any(re.search(r'\d{7,}\.xhtml$', n) for n in z.namelist()):
+            print(f'  내 자료: {pub} {issue}'.rstrip()); _cache[key] = z; _src[key] = 'local'; return z
     try:
         j = json.loads(get(API.format(pub=pub, issue=f'&issue={issue}' if issue else '')))
         url = j['files']['KO']['EPUB'][0]['file']['url']
         z = zipfile.ZipFile(io.BytesIO(get(url)))
-        print(f'  받음: {pub} {issue}'.rstrip())
+        print(f'  받음: {pub} {issue}'.rstrip()); _src[key] = 'jw.org'
     except Exception as e:
         print(f'  없음: {pub} {issue} ({e.__class__.__name__})'); z = None
     _cache[key] = z
@@ -271,10 +315,238 @@ def pages_text(z, pages, limit=12000):
 
 WOL = 'https://wol.jw.org'
 _wol = {}
-def wol_get(path):
+WOL_UA = {'Accept-Language': 'ko', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36'}
+def wol_open(path):
+    """온라인 라이브러리 면을 연다 → (마지막 주소, 글). 연구 자료 찾아보기 링크(/wol/pc/…)는
+       '…/d/r8/lp-ko/1988646#h=6:0-7:0' 처럼 문서 번호와 '그 성구를 다룬 항'(h=)이 붙은 주소로 넘어간다."""
     if path not in _wol:
-        _wol[path] = get(WOL + path, headers={'Accept-Language': 'ko', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36'}).decode('utf-8', 'replace')
+        if _wol: time.sleep(0.35)                      # 온라인 라이브러리에 부담을 주지 않게 천천히
+        req = urllib.request.Request(WOL + path, headers={**UA, **WOL_UA})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            _wol[path] = (r.geturl(), r.read().decode('utf-8', 'replace'))
     return _wol[path]
+
+def wol_get(path): return wol_open(path)[1]
+
+# ---------- 글 다듬기 ----------
+def plain(h):
+    h = re.sub(r'<a[^>]*class="fn"[^>]*>.*?</a>', '', h, flags=re.S)                                  # 각주 표시(*)
+    h = re.sub(r'<a[^>]*epub:type="noteref"[^>]*href="[^"]*footnote[^"]*"[^>]*>.*?</a>', '', h, flags=re.S)
+    h = re.sub(r'</?(?:a|strong|em|span|b|i|u|sup|sub|ruby|rb)\b[^>]*>', '', h)                           # 글자 꾸밈 표시는 띄어쓰기 없이 뺀다
+    return re.sub(r'\s+', ' ', unescape(re.sub(r'<[^>]+>', ' ', h)).replace('\xa0', ' ')).strip()
+
+TOK = re.compile(r'<span[^>]*class="pageNum"[^>]*data-no="(\d+)"[^>]*>|<(?:p|h[1-6]|li|div|td|th|figcaption|blockquote)\b[^>]*\bdata-pid="(\d+)"[^>]*>')
+def paragraphs(html):
+    """글을 항(data-pid) 단위로 나눈다 → [[항 번호, 면, 글], …]. 면 표시(pageNum)를 따라 각 항이 몇 면인지도 적는다."""
+    out, idx, page, pid, pos, first = [], {}, None, None, 0, None
+    def add(seg):
+        t = plain(seg)
+        if not t or pid is None: return
+        if pid in idx: out[idx[pid]][2] += ' ' + t
+        else: idx[pid] = len(out); out.append([pid, page, t])
+    for m in TOK.finditer(html):
+        add(html[pos:m.start()]); pos = m.end()
+        if m[1]:
+            page = int(m[1]); first = first or page
+        else: pid = int(m[2])
+    add(html[pos:])
+    for x in out:                                      # 첫 면 표시 앞의 글은 그 앞 면이다
+        if x[1] is None: x[1] = (first - 1) if first else 0
+    return [x for x in out if x[2] not in ('답을 적는 칸', '^')]
+
+def parse_h(url):
+    """'…#h=6:0-7:0' → (6, 6) · '…#h=8:0-9:120' → (8, 9) : 그 성구를 다룬 항의 범위"""
+    m = re.search(r'[#&]h=(\d+)(?::(\d+))?(?:-(\d+)(?::(\d+))?)?', url or '')
+    if not m: return None
+    a = int(m[1]); b = int(m[3]) if m[3] else a
+    if m[3] and m[4] is not None and int(m[4]) == 0 and b > a: b -= 1
+    return (a, b)
+
+def verse_pids(paras, c, v):
+    """항(h=) 표시가 없을 때: 'c:v'(범위 1:12-22, 나열 1:12, 22 포함)를 언급한 항을 찾는다"""
+    hit = []
+    for pid, _, t in paras:
+        for m in re.finditer(rf'(?<![\d:]){c}:(\d+(?:\s*[-–]\s*\d+)?(?:,\s*\d+(?:\s*[-–]\s*\d+)?(?!\s*:))*)', t):
+            for part in re.split(r',\s*', m[1]):
+                ab = [int(x) for x in re.split(r'\s*[-–]\s*', part) if x.isdigit()]
+                if ab and ab[0] <= int(v) <= ab[-1]: hit.append(pid)
+    return hit
+
+def label_pages(label, span=6):
+    pm = re.search(r'(\d{1,4})(?:\s*-\s*(\d{1,4}))?\s*면', label)
+    return list(range(int(pm[1]), min(int(pm[2] or pm[1]), int(pm[1]) + span) + 1)) if pm else []
+
+def epub_doc(z, pages):
+    """EPUB에서 그 면이 들어 있는 문서를 찾아 항 단위로 꺼낸다"""
+    want = set(pages)
+    for n in spine(z):
+        raw = z.read(n).decode('utf-8', 'replace')
+        nums = {int(x) for x in re.findall(r'class="pageNum"[^>]*data-no="(\d+)"', raw)}
+        if nums and (nums & want or (min(nums) - 1) in want):
+            ps = paragraphs(raw)
+            if ps:
+                t = re.search(r'<title>(.*?)</title>', raw, re.S)
+                return {'id': (re.search(r'(\d{7,})\.x?html$', n) or [0, n])[1], 'title': plain(t[1]) if t else '', 'paras': ps}
+    return None
+
+def wol_doc(url, html):
+    body = html[html.find('<article'):] if '<article' in html else html
+    end = body.find('</article>')
+    ps = paragraphs(body[:end] if end > 0 else body)
+    t = re.search(r'<title>(.*?)</title>', html, re.S)
+    did = re.search(r'/d/[^/]+/[^/]+/(\d+)', url or '')
+    return {'id': did[1] if did else url, 'title': re.sub(r'\s*[—-]\s*워치타워 온라인 라이브러리\s*$', '', plain(t[1])) if t else '', 'paras': ps} if ps else None
+
+DOC_MAX = 60000
+def trim_doc(doc, pages, pids):
+    """아주 긴 문서(「통찰」 항목 등)는 가리킨 면과 그 성구를 다룬 항 주변만 남긴다"""
+    if sum(len(p[2]) for p in doc['paras']) <= DOC_MAX: return doc
+    want, keep = set(pages), set()
+    for i, p in enumerate(doc['paras']):
+        if p[1] in want or (pids and pids[0] - 4 <= p[0] <= pids[1] + 4): keep.add(i)
+    ps, n = [], 0
+    for i in sorted(keep):
+        n += len(doc['paras'][i][2])
+        if n > DOC_MAX: break
+        ps.append(doc['paras'][i])
+    return dict(doc, paras=ps or doc['paras'][:40], part=True)
+
+def fetch_ref(label, href, c=None, v=None):
+    """연구 자료 찾아보기 한 항목의 원문을 가져온다.
+       순서: ① 내 자료 폴더(D:\\JW)의 EPUB → ② 온라인 라이브러리(그 성구를 다룬 항까지 알려 준다) → ③ jw.org 공식 EPUB.
+       반환: (문서 {id,title,paras}, 항 범위 (a,b) 또는 None, 어디서 왔는지) — 못 찾으면 (None, None, '')"""
+    pages = label_pages(label)
+    doc = h = None; via = ''
+    code = issue = None
+    if local_epubs() and pages:
+        try:
+            code, issue, _ = resolve(label)
+            z = local_epub(code, issue) if code else None
+            doc = epub_doc(z, pages) if z else None
+            if doc: via = 'local'
+        except Exception as e: print(f'  내 자료 확인 실패: {label[:30]} ({e.__class__.__name__})')
+    if not doc and href:
+        try:
+            url, html = wol_open(href); doc = wol_doc(url, html); h = parse_h(url)
+            if doc: via = 'wol'
+        except Exception as e: print(f'  온라인 라이브러리 실패: {label[:30]} ({e.__class__.__name__} {getattr(e, "code", "")})')
+    if not doc and pages:
+        try:
+            if code is None: code, issue, _ = resolve(label)
+            z = epub(code, issue) if code else None
+            doc = epub_doc(z, pages) if z else None
+            if doc: via = _src.get((code, issue), 'jw.org')
+        except Exception as e: print(f'  공식 파일 실패: {label[:30]} ({e.__class__.__name__})')
+    if not doc: return None, None, ''
+    if h:                                               # 가리킨 항이 실제로 그 문서에 있을 때만 쓴다
+        ids = {p[0] for p in doc['paras']}
+        if not any(h[0] <= i <= h[1] for i in ids): h = None
+    if not h and c and v:
+        on = [p for p in doc['paras'] if p[1] in set(pages)] or doc['paras']
+        hit = verse_pids(on, c, v)
+        if hit: h = (min(hit), max(hit))
+    return trim_doc(doc, pages, h), h, via
+
+def focus_text(doc, h, pages, limit=6000):
+    """그 성구를 다룬 항(앞뒤 한 항씩 포함). 항을 모르면 가리킨 면의 글."""
+    ps = doc['paras']
+    if h: sel = [p for p in ps if h[0] - 1 <= p[0] <= h[1] + 1]
+    else: sel = [p for p in ps if p[1] in set(pages)] or ps
+    return '\n\n'.join(p[2] for p in sel)[:limit]
+
+def study_sections(b, c):
+    """연구용 성경 한 장 → {절: {notes[], foot[], marg[], rsg[(표기, 링크)], dx[]}}"""
+    html = wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{b}/{c}')
+    parts = re.split(r'<div class="section"[^>]*data-key="(\d+)-(\d+)-(\d+)"[^>]*>', html)
+    out = {}
+    for k in range(1, len(parts) - 3, 4):
+        v, body = parts[k + 2], parts[k + 3]
+        lis = lambda block: [plain(x) for x in re.findall(r'<li\b[^>]*>(.*?)</li>', block, re.S)]
+        grp = lambda name: (re.search(rf'<div class="group {name}\b[^"]*">(.*?)</ul>', body, re.S) or [0, ''])[1]
+        notes = [plain(x) for x in re.findall(r'<li class="item studyNote"[^>]*>(.*?)</li>', body, re.S)]
+        foot = [x for x in lis(grp('footnote')) if x]
+        marg = [plain(x) for x in re.findall(r'<span class="marginal title">(.*?)</span>\s*</span>', grp('marginal'), re.S)]
+        rsg, pub, pubs = [], '', {}
+        TITLE = r'「[^」]+」(?:\s*\([^)]*\))?'                         # 「파수대」 · 「파수대」 (연구용)
+        for blk in re.findall(r'<li class="item ref-rsg"[^>]*>(.*?)</li>', body, re.S):
+            for pm in re.finditer(r'<p\b([^>]*)>(.*?)</p>', blk, re.S):
+                links = [(h, plain(t).rstrip(',').strip()) for h, t in re.findall(r'<a [^>]*href="(/[a-z-]+/wol/pc/[^"]+)"[^>]*>(.*?)</a>', pm[2], re.S)]
+                links = [(h, t) for h, t in links if t]
+                if not links:
+                    t = plain(pm[2])
+                    if re.fullmatch(TITLE, t): pub = t
+                    continue
+                if re.search(r'class="[^"]*\bsu\b', pm[1]) or all(re.fullmatch(TITLE, t) for _, t in links):   # 출판물 이름 줄
+                    pub = links[0][1]; pubs.setdefault(pub, links[0][0]); continue
+                # 한 줄에 면이 여러 개: '2006/4, 3,' + '4-5면' → '2006/4, 3면' · '2006/4, 4-5면'
+                m0 = re.match(r'^(.*?)(\d+(?:\s*-\s*\d+)?)\s*면?$', links[0][1])
+                prefix = m0[1] if m0 else ''
+                myeon = any(t.endswith('면') for _, t in links)
+                for i, (href, t) in enumerate(links):
+                    if i and re.fullmatch(r'\d+(?:\s*-\s*\d+)?\s*면?', t): t = prefix + t
+                    if myeon and re.search(r'\d$', t): t += '면'
+                    m = re.match(TITLE, t)
+                    if m: pub = m[0]
+                    lab = t if m else f'{pub} {t}'.strip()
+                    if not any(x[1] == href for x in rsg): rsg.append((lab, href))
+            for name, href in pubs.items():                    # 면 표기 없이 출판물 이름만 있는 참조
+                if not any(l.startswith(name) for l, _ in rsg): rsg.append((name, href))
+        dx = [plain(x).replace('출판물 색인', '').strip() for x in re.findall(r'<li class="item ref-dx"[^>]*>(.*?)</li>', body, re.S)]
+        out[v] = {'notes': notes, 'foot': foot, 'marg': [x.lstrip('+ ') for x in marg], 'rsg': rsg, 'dx': [x for x in dx if x]}
+    return out
+
+SRC_NAME = {'local': '내 자료(D:\\JW)', 'wol': '온라인 라이브러리', 'jw.org': 'jw.org 공식 파일'}
+def study_verse(key):
+    """'24/51/6' → 연구용 성경의 연구 노트·각주·상호 참조·연구 자료 찾아보기(링크를 따라가 원문까지)"""
+    b, c, v = key.split('/')
+    sec = study_sections(b, c).get(v)
+    if not sec: return None
+    refs = []
+    for label, href in sec['rsg'][:20]:
+        doc, h, via = fetch_ref(label, href, c, v)
+        pages = label_pages(label)
+        t = ''
+        if doc:
+            foc = focus_text(doc, h, pages, 4000) if h else ''
+            full = '\n\n'.join(p[2] for p in doc['paras'] if not pages or p[1] in set(pages)) or '\n\n'.join(p[2] for p in doc['paras'])
+            t = (f'[이 성구를 다룬 부분]\n{foc}\n\n[가리킨 면 전체]\n' if foc and foc != full[:len(foc)] else '') + full[:12000]
+        refs.append({'ref': label, 'text': t, 'ok': bool(t), 'via': via, 'doc': doc['id'] if doc else ''})
+    lines = []
+    if sec['notes']: lines.append('[연구 노트] ' + ' / '.join(sec['notes']))
+    if sec['foot']: lines.append('[각주] ' + ' / '.join(sec['foot']))
+    if sec['rsg']: lines.append('[연구 자료 찾아보기] ' + '; '.join(l for l, _ in sec['rsg']))
+    if sec['dx']: lines.append('[출판물 색인] ' + '; '.join(sec['dx']))
+    if sec['marg']: lines.append('[상호 참조] ' + ' / '.join(sec['marg']))
+    return {'notes': '\n'.join(lines) or '(연구 노트 없음)', 'refs': refs}
+
+CH_VER = 2
+def study_chapter(key, max_refs=200):
+    """'24/51' → 그 장 모든 절의 연구 노트 + 연구 자료 찾아보기 '전부'의 원문.
+       같은 기사를 여러 절이 가리키면 기사 글(docs)은 한 번만 담고, 절마다 '그 성구를 다룬 항'(h)만 따로 적는다.
+       반환: {v:2, verses:{절:{notes, rsg[표기], refs[{ref, doc, h, pages, via, text}]}}, docs:{문서 번호:{title, paras}}, refs:[옛 앱용 {v, ref, text}]}"""
+    b, c = key.split('/')
+    secs = study_sections(b, c)
+    verses, docs, flat, n, src = {}, {}, [], 0, {}
+    for v in sorted(secs, key=int):
+        sec = secs[v]
+        if v == '0' or not (sec['notes'] or sec['rsg']): continue
+        refs = []
+        for label, href in sec['rsg']:
+            if n >= max_refs: break
+            n += 1
+            doc, h, via = fetch_ref(label, href, c, v)
+            if not doc: refs.append({'ref': label, 'ok': False}); continue
+            did = str(doc['id'])
+            old = docs.get(did)
+            if not old or len(doc['paras']) > len(old['paras']): docs[did] = {'title': doc['title'], 'paras': doc['paras'], **({'part': True} if doc.get('part') else {})}
+            pages = label_pages(label)
+            text = focus_text(doc, h, pages)
+            refs.append({'ref': label, 'ok': True, 'doc': did, 'h': list(h) if h else None, 'pages': pages, 'via': via, 'text': text})
+            flat.append({'v': v, 'ref': label, 'text': text[:3500]})
+            src[via] = src.get(via, 0) + 1
+        verses[v] = {'notes': ' / '.join(sec['notes']), 'rsg': [l for l, _ in sec['rsg']], 'refs': refs}
+    return {'v': CH_VER, 'verses': verses, 'docs': docs, 'refs': flat, 'src': src}
+
 
 def wol_ref(ref, ch, pages, doc=''):
     """연구용 성경 장 페이지(연구 자료 찾아보기) 또는 출판물 문서(doc)에서 그 참조의 링크를 찾아 열고, 해당 면 글을 꺼낸다"""
@@ -289,71 +561,6 @@ def wol_ref(ref, ch, pages, doc=''):
     body = html[html.find('<article'):] if '<article' in html else html
     return html_pages(body, pages) if pages else ''
 
-def study_verse(key):
-    """'24/51/6' → 연구용 성경의 연구 노트·각주·상호 참조·연구 자료 찾아보기(링크를 따라가 해당 면 글까지)"""
-    from bs4 import BeautifulSoup
-    b, c, v = key.split('/')
-    soup = BeautifulSoup(wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{b}/{c}'), 'html.parser')
-    sec = soup.select_one(f'div.section[data-key="{b}-{c}-{v}"]')
-    if not sec: return None
-    txt = lambda el: re.sub(r'\s+', ' ', el.get_text(' ', strip=True)).strip()
-    notes = [txt(li) for li in sec.select('.studyNoteGroup li.studyNote')]
-    foot = [txt(li) for li in sec.select('.group.footnote li')]
-    marg = [txt(li).lstrip('+') for li in sec.select('.group.marginal li')]
-    rsg_links = {}
-    for li in sec.select('.group.index li.ref-rsg'):
-        for a in li.select('a[href*="/wol/pc/"]'):
-            rsg_links[a['href']] = (rsg_links.get(a['href'], '') + ' ' + txt(a)).strip()
-    dx = [txt(li).replace('출판물 색인', '').strip() for li in sec.select('.group.index li.ref-dx')]
-    refs = []
-    for href, label in list(rsg_links.items())[:6]:
-        pm = re.search(r'(\d{1,4})(?:\s*-\s*(\d{1,4}))?\s*면', label)
-        pages = list(range(int(pm[1]), min(int(pm[2] or pm[1]), int(pm[1]) + 5) + 1)) if pm else []
-        try:
-            html = wol_get(href); body = html[html.find('<article'):] if '<article' in html else html
-            t = html_pages(body, pages) if pages else ''
-            if not t:
-                p = Text(); p.feed(body); t = '\n\n'.join(p.lines())[:4000]
-        except Exception as e: t = ''
-        refs.append({'ref': label, 'text': t, 'ok': bool(t)})
-    lines = []
-    if notes: lines.append('[연구 노트] ' + ' / '.join(notes))
-    if foot: lines.append('[각주] ' + ' / '.join(foot))
-    if rsg_links: lines.append('[연구 자료 찾아보기] ' + '; '.join(rsg_links.values()))
-    if dx: lines.append('[출판물 색인] ' + '; '.join(dx))
-    if marg: lines.append('[상호 참조] ' + ' / '.join(marg))
-    return {'notes': '\n'.join(lines) or '(연구 노트 없음)', 'refs': refs}
-
-def study_chapter(key, max_pages=14):
-    """'24/51' → 그 장 모든 절의 연구 노트·연구 자료 찾아보기 목록 + 연구 자료 찾아보기 면 글(최대 max_pages개)"""
-    from bs4 import BeautifulSoup
-    b, c = key.split('/')
-    soup = BeautifulSoup(wol_get(f'/ko/wol/b/r8/lp-ko/nwtsty/{b}/{c}'), 'html.parser')
-    txt = lambda el: re.sub(r'\s+', ' ', el.get_text(' ', strip=True)).strip()
-    verses, links = {}, []
-    for sec in soup.select(f'div.section[data-key^="{b}-{c}-"]'):
-        v = sec['data-key'].split('-')[-1]
-        notes = [txt(li) for li in sec.select('.studyNoteGroup li.studyNote')]
-        rsg = {}
-        for li in sec.select('.group.index li.ref-rsg'):
-            for a in li.select('a[href*="/wol/pc/"]'):
-                rsg[a['href']] = (rsg.get(a['href'], '') + ' ' + txt(a)).strip()
-        if notes or rsg:
-            verses[v] = {'notes': ' / '.join(notes), 'rsg': list(rsg.values())}
-            links += [(v, h, l) for h, l in rsg.items()]
-    refs, seen = [], set()
-    for v, href, label in links:
-        if len(refs) >= max_pages or href in seen: continue
-        seen.add(href)
-        pm = re.search(r'(\d{1,4})(?:\s*-\s*(\d{1,4}))?\s*면', label)
-        pages = list(range(int(pm[1]), min(int(pm[2] or pm[1]), int(pm[1]) + 3) + 1)) if pm else []
-        try:
-            html = wol_get(href); body = html[html.find('<article'):] if '<article' in html else html
-            t = html_pages(body, pages, 3500) if pages else ''
-        except Exception: t = ''
-        if t: refs.append({'v': v, 'ref': label, 'text': t})
-    return {'verses': verses, 'refs': refs}
-
 def html_pages(html, pages, limit=12000):
     segs = re.split(r'<span[^>]*class="pageNum"[^>]*data-no="(\d+)"[^>]*>', html)
     want = set(pages); got = []
@@ -364,6 +571,26 @@ def html_pages(html, pages, limit=12000):
     if not got: return ''
     p = Text(); p.feed('<div><p>' + ''.join(got))
     return '\n\n'.join(l for l in p.lines() if l not in ('답을 적는 칸',))[:limit]
+
+BOOKS = ('창세기 출애굽기 레위기 민수기 신명기 여호수아 사사기 룻기 사무엘상 사무엘하 열왕기상 열왕기하 역대기상 역대기하 에스라 느헤미야 에스더 욥기 시편 잠언 전도서 아가 이사야 예레미야 예레미야애가 에스겔 다니엘 호세아 요엘 아모스 오바댜 요나 미가 나훔 하박국 스바냐 학개 스가랴 말라기 '
+         '마태복음 마가복음 누가복음 요한복음 사도행전 로마서 고린도전서 고린도후서 갈라디아서 에베소서 빌립보서 골로새서 데살로니가전서 데살로니가후서 디모데전서 디모데후서 디도서 빌레몬서 히브리서 야고보서 베드로전서 베드로후서 요한1서 요한2서 요한3서 유다서 요한계시록').split()
+def chapter_keys(rng):
+    """'예레미야 애가 1-2장' → ['25/1', '25/2']"""
+    m = re.match(r'\s*(.+?)\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*장', rng or '')
+    if not m: return []
+    name = re.sub(r'\s', '', m[1])
+    name = {'탈출기': '출애굽기', '재판관기': '사사기', '솔로몬의노래': '아가', '계시록': '요한계시록'}.get(name, name)
+    if name not in BOOKS: return []
+    return [f'{BOOKS.index(name) + 1}/{c}' for c in range(int(m[2]), int(m[3] or m[2]) + 1)]
+
+def auto_chapters(weekly):
+    """이번 주와 다음 두 주의 성경 읽기 범위 — 앱을 열지 않아도 미리 받아 둔다"""
+    out = []
+    today = dt.datetime.now(KST).date(); mon = (today - dt.timedelta(days=today.weekday())).isoformat()
+    for f in (weekly or {}).get('files', []):
+        m = re.match(r'(\d{4}-\d{2}-\d{2})_성경범위_(.+)\.txt$', f.get('name', ''))
+        if m and mon <= m[1] <= (dt.date.fromisoformat(mon) + dt.timedelta(days=14)).isoformat(): out += chapter_keys(m[2])
+    return out
 
 def handle_requests(gh, gid, gist):
     files = gist.get('files', {})
@@ -376,15 +603,34 @@ def handle_requests(gh, gid, gist):
     reqs = read(REQ_FILE) or []
     have = read(REF_FILE) or {}
     norm = [r if isinstance(r, dict) else {'ref': r} for r in reqs]
-    chapters = [r['studych'] for r in norm if r.get('studych') and 'studych:' + r['studych'] not in have]
+    # 장 단위: 아직 없거나 옛 형식(원문 일부만 받던 것)이면 새로 받는다. 원문 전체는 장마다 따로 파일(jw-ch-책-장.json)에 둔다.
+    old = lambda k: have.get('studych:' + k)
+    chapters = [r['studych'] for r in norm if r.get('studych') and (not old(r['studych']) or (old(r['studych']).get('ok') and old(r['studych']).get('v', 1) < CH_VER))]
+    try: chapters += [k for k in auto_chapters(read(GIST_FILE)) if not old(k) or (old(k).get('ok') and old(k).get('v', 1) < CH_VER)]
+    except Exception as e: print('  읽기 범위 미리 받기 건너뜀:', e.__class__.__name__)
+    chapters = [k for i, k in enumerate(chapters) if k not in chapters[:i]]
+    extra = {}; t0 = time.time()
     for k in chapters[:6]:
+        if time.time() - t0 > 600: print('  시간이 다 되어 남은 장은 다음 실행 때 받습니다.'); break
         try:
             st = study_chapter(k)
-            have['studych:' + k] = dict(st, ok=bool(st['verses']), at=dt.datetime.now(KST).isoformat(timespec='seconds'))
-            print(f"  ✓ 장 연구 노트 {k} · 절 {len(st['verses'])}개 · 연구 자료 면 {len(st['refs'])}개")
+            fname = 'jw-ch-' + k.replace('/', '-') + '.json'
+            nref = sum(1 for x in st['verses'].values() for r in x['refs'] if r.get('ok'))
+            miss = sum(1 for x in st['verses'].values() for r in x['refs'] if not r.get('ok'))
+            extra[fname] = json.dumps(st, ensure_ascii=False)
+            have['studych:' + k] = {'ok': bool(st['verses']), 'v': CH_VER, 'file': fname, 'at': dt.datetime.now(KST).isoformat(timespec='seconds'),
+                'n': {'verses': len(st['verses']), 'refs': nref, 'miss': miss, 'docs': len(st['docs'])}, 'src': st['src'],
+                # 옛 앱도 읽을 수 있게 가벼운 요약을 함께 둔다
+                'verses': {v: {'notes': x['notes'], 'rsg': x['rsg']} for v, x in st['verses'].items()},
+                'refs': [dict(r, text=r['text'][:1200]) for r in st['refs'][:40]]}
+            print(f"  ✓ 장 연구 노트 {k} · 절 {len(st['verses'])}개 · 연구 자료 원문 {nref}건(못 찾음 {miss}) · 기사 {len(st['docs'])}개 · 출처 {st['src']} · {len(extra[fname]):,}자")
         except Exception as e:
-            have['studych:' + k] = {'ok': False, 'err': e.__class__.__name__, 'verses': {}, 'refs': []}
+            if not old(k): have['studych:' + k] = {'ok': False, 'err': e.__class__.__name__, 'verses': {}, 'refs': []}
             print(f'  ✗ 장 연구 노트 {k} ({e.__class__.__name__} {getattr(e, "code", "")})')
+    # 6주 지난 장 파일은 지운다 (Gist가 무거워지지 않게)
+    cut = (dt.datetime.now(KST) - dt.timedelta(days=42)).isoformat(timespec='seconds')
+    for hk in [x for x in have if x.startswith('studych:') and have[x].get('file') and have[x].get('at', '9') < cut]:
+        extra[have[hk]['file']] = None; del have[hk]
     studies = [r['study'] for r in norm if r.get('study') and 'study:' + r['study'] not in have]
     for k in studies[:40]:
         try:
@@ -411,13 +657,37 @@ def handle_requests(gh, gid, gist):
         except Exception as e:
             have[ref] = {'text': '', 'ok': False, 'err': e.__class__.__name__}
             print(f'  ✗ {ref[:40]} ({e.__class__.__name__})')
-    if todo or studies or chapters:
-        gh('/gists/' + gid, {'files': {REF_FILE: {'content': json.dumps(have, ensure_ascii=False)}}}, 'PATCH')
+    if todo or studies or chapters or extra:
+        out = {REF_FILE: {'content': json.dumps(have, ensure_ascii=False)}}
+        for name, content in extra.items():
+            if content is not None: out[name] = {'content': content}
+            elif name in files: out[name] = None
+        gh('/gists/' + gid, {'files': out}, 'PATCH')
         print('요청한 면을 Gist에 저장했습니다.')
 
+TOKEN_FILE = os.path.join(os.path.expanduser('~'), '.jiphoe_token')
+def read_token():
+    """GitHub에서는 비밀값(JW_GIST_TOKEN). 내 컴퓨터에서는 처음 한 번 물어서 내 사용자 폴더에만 저장해 둔다."""
+    t = os.environ.get('JW_GIST_TOKEN', '').strip()
+    if t: return t
+    if os.path.exists(TOKEN_FILE):
+        t = open(TOKEN_FILE, encoding='utf-8').read().strip()
+        if t: return t
+    if sys.stdin and sys.stdin.isatty():
+        print('앱 설정의 동기화에 넣은 것과 같은 GitHub 토큰(gist 권한)을 붙여넣고 Enter를 누르세요.')
+        print(f'(이 컴퓨터의 {TOKEN_FILE} 에만 저장됩니다. 지우면 다시 묻습니다.)')
+        t = input('GitHub 토큰: ').strip()
+        if t:
+            with open(TOKEN_FILE, 'w', encoding='utf-8') as f: f.write(t)
+    return t
+
 def main():
-    token = os.environ.get('JW_GIST_TOKEN', '').strip()
-    if not token: sys.exit('JW_GIST_TOKEN 비밀값이 없습니다.')
+    for st in (sys.stdout, sys.stderr):
+        try: st.reconfigure(encoding='utf-8', errors='replace')
+        except Exception: pass
+    token = read_token()
+    if not token: sys.exit('GitHub 토큰이 없습니다 (JW_GIST_TOKEN).')
+    local_epubs()
     mode = os.environ.get('MODE', 'all')
     gh = lambda path, body=None, method=None: json.loads(get('https://api.github.com' + path,
         data=json.dumps(body).encode() if body is not None else None, method=method,
