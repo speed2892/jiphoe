@@ -18,13 +18,12 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install beautifulsoup4
       - name: 이번 주와 다음 주 자료를 비공개 Gist에 넣기
         env:
           JW_GIST_TOKEN: ${{ secrets.JW_GIST_TOKEN }}
