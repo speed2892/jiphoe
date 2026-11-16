@@ -172,7 +172,7 @@ details.more summary{cursor:pointer;font-weight:600}
 
 <script>
 'use strict';
-const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.5 (연구 자료 찾아보기 원문 전부·출처 표시)' };
+const APP = { name:'집회 준비', id:'jiphoe-hub', version:'1.0.6 (파수대 연구 단추 고침·연구 자료 원문 전부)' };
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2296,10 +2296,6 @@ const Views = {
       ${a.review.length ? `<div class="card" style="margin-top:14px"><h2>❓ 복습 질문</h2><ul class="plan">${a.review.map(q=>`<li><span class="ic">•</span><div>${esc(q)}</div></li>`).join('')}</ul></div>` : ''}
       <details class="more" style="margin-top:14px"><summary>다른 기사 불러오기·바꾸기</summary>${wolBtn}${imp}</details>`);
     bindImp();
-    const missAll = [...new Set(c.groups.flatMap(g=>g.qs.flatMap(q=>q.missing||[])))];
-    if(missAll.length && Sync.token() && !el.dataset.refsChecked){ el.dataset.refsChecked = 1;
-      JWRefs.load().then(()=>{ const pool = CBS.pool(id); if(missAll.some(r=>CBS.citesFor(r, pool).found.length)) render(); }).catch(()=>{}); }
-    if(missAll.length && Sync.token()){ JWRefs.request(missAll.map(ref=>({ref, doc:data.doc||''}))).then(()=>{ const st = $('#cbsSt'); if(st){ st.className='st'; st.textContent = `참조 출판물 ${missAll.length}개를 GitHub에 요청했습니다 — 몇 분 뒤(늦어도 1시간) 이 화면을 다시 여세요.`; } }).catch(()=>{}); }
     const saveAns = () => { const cur = Store.get('wt', id) || a; cur.ans = ans; Store.set('wt', id, cur); };
     $$('.qcard', el).forEach(card=>{
       const p = a.paras.find(x=>x.qn===card.dataset.qn); ans[p.qn] ||= {};
@@ -2374,6 +2370,10 @@ const Views = {
         <label>내 해설 메모</label><textarea data-k="mine" style="min-height:60px" placeholder="내가 말할 해설을 적어 두세요.">${esc(an.mine||'')}</textarea></div>`; }).join('')}`).join('')}
       <details class="more" style="margin-top:14px"><summary>다른 교재 넣기·바꾸기</summary>${imp}</details>`);
     bindImp();
+    const missAll = [...new Set(c.groups.flatMap(g=>g.qs.flatMap(q=>q.missing||[])))];
+    if(missAll.length && Sync.token() && !el.dataset.refsChecked){ el.dataset.refsChecked = 1;
+      JWRefs.load().then(()=>{ const pool = CBS.pool(id); if(missAll.some(r=>CBS.citesFor(r, pool).found.length)) render(); }).catch(()=>{}); }
+    if(missAll.length && Sync.token()){ JWRefs.request(missAll.map(ref=>({ref, doc:data.doc||''}))).then(()=>{ const st = $('#cbsSt'); if(st){ st.className='st'; st.textContent = `참조 출판물 ${missAll.length}개를 GitHub에 요청했습니다 — 몇 분 뒤(늦어도 1시간) 이 화면을 다시 여세요.`; } }).catch(()=>{}); }
     const saveAns = () => { const cur = Store.get('cbs', id) || data; cur.ans = ans; Store.set('cbs', id, cur); };
     const find = qid => { for(const g of c.groups){ const q = g.qs.find(x=>x.id===qid); if(q) return [g, q]; } return []; };
     $$('.qcard', el).forEach(card=>{
